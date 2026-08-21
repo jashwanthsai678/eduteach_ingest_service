@@ -56,7 +56,7 @@ def _run_job(job_id: str, pdf_path: Path, book_id: str, board: str, grade: str, 
 
         _update_job(job_id, stage="publishing", detail="Uploading to Supabase")
         book_uuid = publish.publish_phase2_book(pdf_path, result, board, grade, subject, language, school_id)
-        _update_job(job_id, status="done", book_uuid=book_uuid, chapter_count=len(result["chapters"]))
+        _update_job(job_id, status="done", book_uuid=book_uuid, book_id=book_id, chapter_count=len(result["chapters"]))
     except Exception as exc:
         _update_job(job_id, status="failed", reason=repr(exc))
     finally:
