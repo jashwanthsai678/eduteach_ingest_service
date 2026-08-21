@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+uploads/
+images/
+server.log
+.env
