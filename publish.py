@@ -84,6 +84,11 @@ def adapt_chapter(canonical: dict) -> dict:
             fig_n += 1
             images.append({"path": item["image_path"], "caption": item.get("description", ""), "page": item["page"]})
             lines.append(f"[FIGURE {fig_n}]")
+        elif ctype == "image_description":
+            # Simple/generic content judged redrawable from text alone (Stage 8's
+            # keep_description_only tier) -- no file was ever cropped or saved for
+            # this one, so it has no [FIGURE n] slot and nothing to upload.
+            lines.append(f"[FIGURE DESCRIPTION] {item.get('description', '')}")
         elif ctype in _TAG_MAP:
             lines.append(f"[{_TAG_MAP[ctype]}] {item['text']}")
     return {

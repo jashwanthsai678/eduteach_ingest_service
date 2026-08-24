@@ -40,7 +40,7 @@ def stage5_build_blocks(doc, start_page: int, end_page: int) -> list[dict]:
     return all_blocks
 
 
-def process_chapter(doc, ch: dict, book_id: str, images_dir: Path, api_key: str) -> dict:
+def process_chapter(doc, ch: dict, book_id: str, images_dir: Path, api_key: str, image_cache: list | None = None) -> dict:
     blocks = stage5_build_blocks(doc, ch["start_page"], ch["end_page"])
     text_blocks = [b for b in blocks if b["type"] == "text"]
     image_blocks = [b for b in blocks if b["type"] == "image"]
@@ -62,7 +62,7 @@ def process_chapter(doc, ch: dict, book_id: str, images_dir: Path, api_key: str)
         texts = [s["text"] for s in siblings[max(0, idx - 2):idx] + siblings[idx + 1:idx + 3] if s["type"] == "text"]
         return "\n".join(texts)
 
-    image_decisions = sel.select_image_blocks(image_blocks, crop_fn, context_fn, api_key) if image_blocks else {}
+    image_decisions = sel.select_image_blocks(image_blocks, crop_fn, context_fn, api_key, image_cache) if image_blocks else {}
 
     kept = []
     for b in blocks:
@@ -75,15 +75,23 @@ def process_chapter(doc, ch: dict, book_id: str, images_dir: Path, api_key: str)
             d = image_decisions.get(b["block_id"])
             if not d or not d.get("keep"):
                 continue
-            img_path = images_dir / f"{b['block_id']}.png"
-            images_dir.mkdir(parents=True, exist_ok=True)
-            page = doc[b["page"] - 1]
-            pix = page.get_pixmap(clip=pymupdf.Rect(*b["bbox"]), dpi=150)
-            pix.save(img_path)
-            kept.append({
-                "block_id": b["block_id"], "page": b["page"], "content_type": "image", "bbox": b["bbox"],
-                "image_path": str(img_path), "description": d.get("reason", ""),
-            })
+            if d.get("save_image", True):
+                img_path = images_dir / f"{b['block_id']}.png"
+                images_dir.mkdir(parents=True, exist_ok=True)
+                page = doc[b["page"] - 1]
+                pix = page.get_pixmap(clip=pymupdf.Rect(*b["bbox"]), dpi=150)
+                pix.save(img_path)
+                kept.append({
+                    "block_id": b["block_id"], "page": b["page"], "content_type": "image", "bbox": b["bbox"],
+                    "image_path": str(img_path), "description": d.get("reason", ""),
+                })
+            else:
+                # Content is real but simple/generic enough that the description alone
+                # substitutes for the picture -- no crop, no file, no upload needed at all.
+                kept.append({
+                    "block_id": b["block_id"], "page": b["page"], "content_type": "image_description",
+                    "bbox": b["bbox"], "description": d.get("reason", ""),
+                })
 
     kept.sort(key=lambda e: (e["page"], round(e["bbox"][1] / 10), e["bbox"][0]))
     for i, e in enumerate(kept, start=1):
@@ -111,11 +119,14 @@ def process_book(pdf_path: Path, book_id: str, images_dir: Path, api_key: str, o
     chapters_meta = detection["chapters"]
     report("processing_chapters", f"{len(chapters_meta)} chapter(s) detected, offset={detection['offset']}")
 
+    image_cache = []  # shared across every chapter below -- a recurring image (banner,
+    # footer icon) is judged by Gemini once and reused for every later occurrence,
+    # matched via tolerant perceptual-hash comparison (see chapter_select.py's _find_cached).
     processed = []
     for i, ch in enumerate(chapters_meta, start=1):
         report("processing_chapters", f"chapter {i}/{len(chapters_meta)}: {ch['title']}")
         try:
-            canonical = process_chapter(doc, ch, book_id, images_dir, api_key)
+            canonical = process_chapter(doc, ch, book_id, images_dir, api_key, image_cache)
             processed.append(canonical)
         except Exception as exc:
             report("chapter_failed", f"chapter {i} '{ch['title']}' failed: {exc!r}")

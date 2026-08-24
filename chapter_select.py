@@ -33,6 +33,11 @@ import numpy as np
 import requests
 
 _TINY_IMAGE_MAX_AREA = 1600  # Phase 1's build_chapters.py _TINY_IMAGE_MAX_AREA, reused as-is
+_HASH_SIZE = 12  # 12x12 -- Phase 1's validated average-hash size (see apply_image_triage.py)
+_HASH_HAMMING_THRESHOLD = 8  # out of 144 bits -- same tolerance Phase 1 validated with zero
+# observed false positives across a full book; an exact-match hash would only catch
+# byte-identical crops and miss the common case of the same banner/icon recurring with
+# minor pixel differences (a different page number baked in, slight compression variance).
 MODEL = "google/gemini-2.5-flash"
 _API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -53,22 +58,37 @@ IMAGE_JUDGE_PROMPT = (
     "FIRST, check: is this primarily a CHAPTER-OPENER TITLE BANNER -- decorative "
     "artwork with the chapter/section title text rendered inside the graphic itself "
     "(even if the artwork is thematically related to the topic, e.g. a family drawing "
-    "on a chapter about family)? If so, ALWAYS drop it (keep=false) -- that title text "
-    "is already captured separately as a heading block, so keeping the banner too would "
-    "serve the same title twice. The giveaway: the image mostly consists of a title-sized "
-    "text string as its main content, not a scene/diagram illustrating a specific lesson point.\n\n"
-    "OTHERWISE, decide: is this genuine lesson content (a diagram, a scene illustrating a "
-    "specific point in the lesson, labeled information) that should be kept, or is it "
-    "decorative page furniture (a border, a generic bullet icon, a repeated banner element)? "
-    "Default to KEEPING if genuinely unsure between real content and decoration -- a "
-    "wrongly-kept decorative image costs nothing; a wrongly-dropped real one loses real "
-    "content. This default does NOT apply to the title-banner check above, which is always "
-    "drop regardless of uncertainty.\n\n"
-    'Write "reason" as a caption a teacher could use to reference this figure WITHOUT '
-    "seeing it -- describe what the image actually shows (2-4 sentences: the scene, any "
-    "labeled elements, names, or values visible), not a justification for your keep/drop "
-    "call. If keep=false, reason can stay a brief one-line note on why it's decorative.\n\n"
-    'Return ONLY {"keep": true/false, "reason": "..."}'
+    "on a chapter about family)? If so, ALWAYS drop it -- that title text is already "
+    "captured separately as a heading block, so keeping the banner too would serve the "
+    "same title twice. The giveaway: the image mostly consists of a title-sized text "
+    "string as its main content, not a scene/diagram illustrating a specific lesson point.\n\n"
+    "OTHERWISE, decide between exactly three outcomes:\n"
+    '- "drop": decorative page furniture (a border, a generic bullet icon, a repeated '
+    "banner element) -- not real lesson content.\n"
+    '- "keep_description_only": genuine lesson content, but SIMPLE and GENERIC enough that '
+    "a good text description fully substitutes for the original picture -- a teacher could "
+    "redraw it on a blackboard from the description alone, or an AI image generator could "
+    "recreate an equivalent illustration from it (e.g. a plain labeled diagram of a few "
+    "circles/arrows showing a cycle, a simple line drawing of a common object, a generic "
+    "icon-style illustration of a concept).\n"
+    '- "keep_image": genuine lesson content that must be kept as the ACTUAL image -- a real '
+    "photograph, a map, a diagram with many specific labels/values/shapes that a description "
+    "cannot faithfully reproduce, or anything where the exact visual detail matters (a "
+    "specific historical picture, a data chart, a diagram whose precise layout is part of "
+    "what's being taught).\n\n"
+    "Default to KEEPING (either keep_image or keep_description_only) if genuinely unsure "
+    "between real content and decoration -- a wrongly-kept decorative image costs nothing; a "
+    "wrongly-dropped real one loses real content. When unsure whether kept content needs the "
+    "real image or just a description, prefer keep_image -- only choose "
+    "keep_description_only when you're confident the description alone is sufficient. This "
+    "default does NOT apply to the title-banner check above, which is always drop regardless "
+    "of uncertainty.\n\n"
+    'Write "reason" as a caption/description a teacher could use to reference or redraw this '
+    "figure WITHOUT seeing it -- describe what the image actually shows (2-4 sentences: the "
+    "scene, any labeled elements, names, or values visible), not a justification for your "
+    'decision. If decision is "drop", reason can stay a brief one-line note on why it\'s '
+    "decorative.\n\n"
+    'Return ONLY {"decision": "drop"/"keep_description_only"/"keep_image", "reason": "..."}'
 )
 
 TEXT_SCHEMA = {
@@ -86,8 +106,11 @@ TEXT_SCHEMA = {
 
 IMAGE_SCHEMA = {
     "type": "object",
-    "properties": {"keep": {"type": "boolean"}, "reason": {"type": "string"}},
-    "required": ["keep", "reason"],
+    "properties": {
+        "decision": {"type": "string", "enum": ["drop", "keep_description_only", "keep_image"]},
+        "reason": {"type": "string"},
+    },
+    "required": ["decision", "reason"],
 }
 
 
@@ -98,6 +121,33 @@ def _is_qr_code(png_bytes: bytes) -> bool:
         return False
     found, _ = cv2.QRCodeDetector().detect(img)
     return bool(found)
+
+
+def _perceptual_hash(png_bytes: bytes) -> np.ndarray | None:
+    """Average-hash (12x12 grayscale, threshold at the mean) -- same size
+    and approach Phase 1 validated with zero observed false positives
+    across a full book (a stricter dual-hash variant was tried and
+    reverted for regressing -- see apply_image_triage.py's
+    find_recurring_images). Used to recognize the SAME recurring image
+    (banners, footer icons) reappearing across pages/chapters so it's
+    only ever sent to Gemini once. Returns a boolean array compared via
+    Hamming distance, not exact equality -- real recurring images vary by
+    a few pixels between occurrences (a different page number baked into
+    the same banner, minor compression differences), so an exact-match
+    hash would miss almost all of them."""
+    arr = np.frombuffer(png_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return None
+    small = cv2.resize(img, (_HASH_SIZE, _HASH_SIZE), interpolation=cv2.INTER_AREA)
+    return (small > small.mean()).flatten()
+
+
+def _find_cached(image_cache: list, img_hash: np.ndarray) -> dict | None:
+    for cached_hash, judged in image_cache:
+        if np.count_nonzero(img_hash != cached_hash) <= _HASH_HAMMING_THRESHOLD:
+            return judged
+    return None
 
 
 def _bbox_area(bbox: list) -> float:
@@ -155,23 +205,61 @@ def judge_image(image_bytes: bytes, context_text: str, api_key: str) -> dict:
     return _call_with_retry(payload, api_key, timeout=60)
 
 
-def select_image_blocks(image_blocks: list[dict], crop_fn, context_fn, api_key: str) -> dict:
+def select_image_blocks(image_blocks: list[dict], crop_fn, context_fn, api_key: str, image_cache: list | None = None) -> dict:
     """image_blocks: [{block_id, page, bbox}]. crop_fn(block) -> png bytes.
-    context_fn(block) -> nearby text string. Returns {block_id: {keep, reason, tier}}."""
+    context_fn(block) -> nearby text string. Returns {block_id: {keep, save_image, reason, tier}}.
+
+    save_image distinguishes two kinds of "keep": True means the actual
+    cropped image must be saved/uploaded (a photo, map, or a diagram whose
+    precise visual detail matters); False means the content is genuine but
+    simple/generic enough that "reason" alone (a teacher-redrawable /
+    AI-regeneratable description) is sufficient, so no file is ever cropped,
+    saved, or uploaded for it downstream -- real storage/upload savings for
+    the images that don't need to be pixel-faithful.
+
+    image_cache: optional list of (perceptual_hash, judgment_result) pairs,
+    shared and mutated across calls (e.g. across every chapter in a book) so
+    a recurring image (banner, footer icon) is only ever sent to Gemini
+    once -- every later occurrence, even with minor pixel differences (a
+    different page number baked into the same banner, slight compression
+    variation), reuses the cached decision via a tolerant Hamming-distance
+    match instead of paying for another vision call. A plain dict keyed by
+    exact hash was tried first and would only catch byte-identical crops --
+    real recurring images almost never hash bit-for-bit identical, so this
+    is a list scanned with _find_cached's tolerance instead. Pass the SAME
+    list into every call for a book to get the cross-chapter benefit; omit
+    it to fall back to no caching."""
+    if image_cache is None:
+        image_cache = []
+
     decisions = {}
     to_judge = []
     for b in image_blocks:
         area = _bbox_area(b["bbox"])
-        crop = crop_fn(b)
         if area <= _TINY_IMAGE_MAX_AREA:
-            decisions[b["block_id"]] = {"keep": False, "reason": "tiny icon (<1600px^2), free tier", "tier": "tiny"}
-        elif _is_qr_code(crop):
-            decisions[b["block_id"]] = {"keep": False, "reason": "QR code, free tier", "tier": "qr"}
+            decisions[b["block_id"]] = {"keep": False, "save_image": False, "reason": "tiny icon (<1600px^2), free tier", "tier": "tiny"}
+            continue
+        crop = crop_fn(b)
+        if _is_qr_code(crop):
+            decisions[b["block_id"]] = {"keep": False, "save_image": False, "reason": "QR code, free tier", "tier": "qr"}
         else:
             to_judge.append((b, crop))
 
     for b, crop in to_judge:
+        img_hash = _perceptual_hash(crop)
+        cached = _find_cached(image_cache, img_hash) if img_hash is not None else None
+        if cached is not None:
+            decisions[b["block_id"]] = {**cached, "tier": "llm_visual_cached"}
+            continue
         result = judge_image(crop, context_fn(b), api_key)
-        decisions[b["block_id"]] = {**result, "tier": "llm_visual"}
+        decision = result.get("decision", "drop")
+        judged = {
+            "keep": decision in ("keep_image", "keep_description_only"),
+            "save_image": decision == "keep_image",
+            "reason": result.get("reason", ""),
+        }
+        decisions[b["block_id"]] = {**judged, "tier": "llm_visual"}
+        if img_hash is not None:
+            image_cache.append((img_hash, judged))
 
     return decisions
