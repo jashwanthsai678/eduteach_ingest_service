@@ -43,22 +43,54 @@ def _update_job(job_id: str, **fields):
 
 
 def _run_job(job_id: str, pdf_path: Path, book_id: str, board: str, grade: str, subject: str, language: str, school_id: str):
+    """Publishes each chapter to Supabase immediately after it finishes,
+    instead of collecting the whole book first and publishing at the very
+    end -- confirmed necessary after a real 18-chapter live run hit Render's
+    512MB OOM ceiling with NOTHING published, even though most/all chapters
+    had already been extracted and paid for. With this, a crash midway
+    through only loses the one chapter in flight; every chapter already
+    finished is already sitting in Supabase by the time it happens."""
     def on_progress(stage: str, detail: str):
         _update_job(job_id, stage=stage, detail=detail)
 
+    uploaded_cache: dict[str, tuple] = {}
+    state = {"book_uuid": None, "published_count": 0, "problem_chapters": []}
+
+    def on_chapters_detected(chapters_meta):
+        _update_job(job_id, stage="publishing", detail="Creating book record")
+        state["book_uuid"] = publish.create_book_row(pdf_path, book_id, board, grade, subject, language, school_id, len(chapters_meta))
+
+    def on_chapter_done(canonical):
+        status = publish.publish_one_chapter(state["book_uuid"], book_id, school_id, canonical, uploaded_cache)
+        state["published_count"] += 1
+        if status["problems"]:
+            state["problem_chapters"].append(status["chapter_number"])
+        _update_job(job_id, stage="processing_chapters", detail=f"chapter {status['chapter_number']} published ({state['published_count']} so far)")
+
     try:
         _update_job(job_id, status="processing", stage="starting")
-        result = pipeline.process_book(pdf_path, book_id, IMAGES_DIR / job_id, OPENROUTER_API_KEY, on_progress=on_progress)
+        result = pipeline.process_book_streaming(
+            pdf_path, book_id, IMAGES_DIR / job_id, OPENROUTER_API_KEY,
+            on_chapter_done=on_chapter_done, on_chapters_detected=on_chapters_detected, on_progress=on_progress,
+        )
 
         if result["status"] != "ok":
+            # Chapter detection itself failed -- nothing could have been published yet either way.
             _update_job(job_id, status="failed", reason=result.get("reason", "chapter detection failed"))
             return
 
-        _update_job(job_id, stage="publishing", detail="Uploading to Supabase")
-        book_uuid = publish.publish_phase2_book(pdf_path, result, board, grade, subject, language, school_id)
-        _update_job(job_id, status="done", book_uuid=book_uuid, book_id=book_id, chapter_count=len(result["chapters"]))
+        _update_job(
+            job_id, status="done", book_uuid=state["book_uuid"], book_id=book_id,
+            chapter_count=state["published_count"], problem_chapters=state["problem_chapters"],
+        )
     except Exception as exc:
-        _update_job(job_id, status="failed", reason=repr(exc))
+        # Even on a hard failure, surface whatever DID make it to Supabase before the
+        # crash -- book_uuid/chapter_count here reflect real, already-published chapters,
+        # not zero, since publishing now happens incrementally rather than at the end.
+        _update_job(
+            job_id, status="failed", reason=repr(exc), book_uuid=state["book_uuid"],
+            book_id=book_id, chapter_count=state["published_count"],
+        )
     finally:
         pdf_path.unlink(missing_ok=True)
 

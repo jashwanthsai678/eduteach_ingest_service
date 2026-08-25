@@ -6,6 +6,7 @@ service deploys standalone) rather than reimplemented, so behavior stays
 identical to what Phase 1 already publishes.
 """
 
+import gc
 import hashlib
 import io
 import os
@@ -97,63 +98,86 @@ def adapt_chapter(canonical: dict) -> dict:
     }
 
 
+def create_book_row(pdf_path: Path, book_id: str, board: str, grade: str, subject: str, language: str, school_id: str, chapter_count: int) -> str:
+    """Creates the book row immediately, before any chapter is processed --
+    lets publish_one_chapter() attach each chapter to a real book_uuid as
+    soon as it finishes, instead of waiting for the whole book to be done."""
+    sha256 = hashlib.sha256(Path(pdf_path).read_bytes()).hexdigest()
+    book_row = _sb_insert("textbook_books", [{
+        "school_id": school_id, "book_id": book_id, "board": board, "grade": str(grade),
+        "subject": subject, "language": language, "source_pdf": Path(pdf_path).name,
+        "source_pdf_sha256": sha256, "chapter_count": chapter_count,
+    }])[0]
+    return book_row["id"]
+
+
+def publish_one_chapter(book_uuid: str, book_id: str, school_id: str, canonical: dict, uploaded_cache: dict, auto_publish: bool = True) -> dict:
+    """Publishes exactly one chapter, immediately -- main.py calls this right
+    after pipeline.process_chapter() returns, chapter by chapter, instead of
+    collecting a whole book's chapters first. That way a crash on chapter 15
+    doesn't erase chapters 1-14, which had already made it into Supabase by
+    the time it happened -- confirmed necessary after a real 18-chapter run
+    hit Render's 512MB OOM ceiling with nothing published at all, since the
+    old publish_phase2_book() only ever ran after every chapter succeeded.
+
+    uploaded_cache: caller-owned dict of {local_image_path: (storage_path,
+    width, height, n_bytes)}, shared across every call for one book -- a
+    recurring image (already deduped to one local file by pipeline.py) is
+    only ever actually uploaded to Supabase Storage once, reused by every
+    later chapter that also references it."""
+    shaped = adapt_chapter(canonical)
+    index = canonical["chapter_number"]
+    content = shaped["content"]
+    image_rows = []
+    for i, img in enumerate(shaped["images"], start=1):
+        image_id = f"img_{book_id}_ch{index:02d}_{i:02d}"
+        local_path = img["path"]
+        if local_path in uploaded_cache:
+            storage_path, width, height, n_bytes = uploaded_cache[local_path]
+        else:
+            storage_key = f"{book_id}/ch{index:02d}/{image_id}.jpg"
+            storage_path, width, height, n_bytes = compress_and_upload_image(Path(local_path), storage_key)
+            uploaded_cache[local_path] = (storage_path, width, height, n_bytes)
+            gc.collect()  # release the just-compressed image bytes before the next upload
+        content = content.replace(f"[FIGURE {i}]", f'<img id="{image_id}" />')
+        image_rows.append({
+            "school_id": school_id, "image_id": image_id, "caption": img["caption"],
+            "storage_path": storage_path, "source_page": img["page"], "width": width,
+            "height": height, "bytes": n_bytes, "order_index": i - 1,
+        })
+
+    problems = validate_chapter(shaped, content, image_rows)
+    is_published = auto_publish and not problems
+
+    chapter_row = _sb_insert("textbook_chapters", [{
+        "book_uuid": book_uuid, "school_id": school_id, "chapter_number": index,
+        "chapter_title": shaped["chapter_title"], "page_start": shaped["start_page"],
+        "page_end": shaped["end_page"], "content_markdown": content,
+        "content_sha256": hashlib.sha256(content.encode()).hexdigest(), "published": is_published,
+    }])[0]
+    chapter_uuid = chapter_row["id"]
+
+    for row in image_rows:
+        row["chapter_uuid"] = chapter_uuid
+    if image_rows:
+        _sb_insert("textbook_images", image_rows)
+
+    return {"chapter_number": index, "chapter_title": shaped["chapter_title"], "published": is_published, "problems": problems, "image_count": len(image_rows)}
+
+
 def publish_phase2_book(
     pdf_path: Path, book_result: dict, board: str, grade: str, subject: str,
     language: str, school_id: str, auto_publish: bool = True,
 ) -> str:
-    sha256 = hashlib.sha256(Path(pdf_path).read_bytes()).hexdigest()
+    """Kept for local one-off scripts (e.g. run_maths_book.py) that already
+    have a whole book's worth of chapters in memory. Implemented on top of
+    create_book_row()/publish_one_chapter() so both paths stay in sync."""
     book_id = f"{board.lower().replace(' ', '_')}_class{grade}_{subject.lower().replace(' ', '_')}_{language}"
-
     chapters = book_result["chapters"]
-    book_row = _sb_insert("textbook_books", [{
-        "school_id": school_id, "book_id": book_id, "board": board, "grade": str(grade),
-        "subject": subject, "language": language, "source_pdf": Path(pdf_path).name,
-        "source_pdf_sha256": sha256, "chapter_count": len(chapters),
-    }])[0]
-    book_uuid = book_row["id"]
+    book_uuid = create_book_row(pdf_path, book_id, board, grade, subject, language, school_id, len(chapters))
 
-    # Keyed by the LOCAL file path pipeline.py already dedup'd a recurring image
-    # down to -- multiple chapters can still reference that same local file (the
-    # cache in pipeline.py is book-wide), so without this, each chapter would
-    # upload it to Supabase Storage again as a separate object. This makes sure
-    # a given local file is only ever actually uploaded once per book.
     uploaded_cache: dict[str, tuple] = {}
-
     for canonical in chapters:
-        shaped = adapt_chapter(canonical)
-        index = canonical["chapter_number"]
-        content = shaped["content"]
-        image_rows = []
-        for i, img in enumerate(shaped["images"], start=1):
-            image_id = f"img_{book_id}_ch{index:02d}_{i:02d}"
-            local_path = img["path"]
-            if local_path in uploaded_cache:
-                storage_path, width, height, n_bytes = uploaded_cache[local_path]
-            else:
-                storage_key = f"{book_id}/ch{index:02d}/{image_id}.jpg"
-                storage_path, width, height, n_bytes = compress_and_upload_image(Path(local_path), storage_key)
-                uploaded_cache[local_path] = (storage_path, width, height, n_bytes)
-            content = content.replace(f"[FIGURE {i}]", f'<img id="{image_id}" />')
-            image_rows.append({
-                "school_id": school_id, "image_id": image_id, "caption": img["caption"],
-                "storage_path": storage_path, "source_page": img["page"], "width": width,
-                "height": height, "bytes": n_bytes, "order_index": i - 1,
-            })
-
-        problems = validate_chapter(shaped, content, image_rows)
-        is_published = auto_publish and not problems
-
-        chapter_row = _sb_insert("textbook_chapters", [{
-            "book_uuid": book_uuid, "school_id": school_id, "chapter_number": index,
-            "chapter_title": shaped["chapter_title"], "page_start": shaped["start_page"],
-            "page_end": shaped["end_page"], "content_markdown": content,
-            "content_sha256": hashlib.sha256(content.encode()).hexdigest(), "published": is_published,
-        }])[0]
-        chapter_uuid = chapter_row["id"]
-
-        for row in image_rows:
-            row["chapter_uuid"] = chapter_uuid
-        if image_rows:
-            _sb_insert("textbook_images", image_rows)
+        publish_one_chapter(book_uuid, book_id, school_id, canonical, uploaded_cache, auto_publish=auto_publish)
 
     return book_uuid

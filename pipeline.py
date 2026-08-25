@@ -4,6 +4,7 @@ from paddle_ocr_vl/phase2_pymupdf_pipeline, made fully automatic (no
 hardcoded per-book chapter list) via toc_detect.py.
 """
 
+import gc
 import re
 from pathlib import Path
 
@@ -204,7 +205,30 @@ def process_chapter(doc, ch: dict, book_id: str, images_dir: Path, api_key: str,
     }
 
 
-def process_book(pdf_path: Path, book_id: str, images_dir: Path, api_key: str, on_progress=None) -> dict:
+def process_book_streaming(
+    pdf_path: Path, book_id: str, images_dir: Path, api_key: str,
+    on_chapter_done, on_chapters_detected=None, on_progress=None,
+) -> dict:
+    """Same detection + per-chapter logic as process_book(), but never holds
+    more than one chapter's content in memory at a time -- confirmed
+    necessary after a real 18-chapter live run crashed Render's 512MB free
+    tier with an OOM (via Render's own log: "Ran out of memory (used over
+    512MB)"), even after the fragment-merge fix. That fix solved one specific
+    failure mode (thousands of tiled fragments in one region); it never
+    addressed the plainer problem that process_book() kept every chapter's
+    full extracted content sitting in one growing list for the entire run.
+
+    on_chapter_done(canonical) is called immediately after each chapter
+    finishes -- the caller (main.py) publishes it right away, so a later
+    crash doesn't erase already-finished chapters, only the one in flight --
+    after which this function drops its own reference and forces a
+    garbage-collection pass before moving to the next chapter, instead of
+    letting 18 chapters' worth of retained data quietly accumulate.
+
+    on_chapters_detected(chapters_meta), if given, is called once right
+    after chapter detection succeeds, before any chapter is processed --
+    lets the caller create the Supabase book row at the right time, with a
+    known chapter_count, before any per-chapter publish call needs it."""
     def report(stage, detail=""):
         if on_progress:
             on_progress(stage, detail)
@@ -214,22 +238,42 @@ def process_book(pdf_path: Path, book_id: str, images_dir: Path, api_key: str, o
     detection = toc_detect.detect_chapters(doc, api_key)
     if detection["status"] != "ok":
         report("failed", detection.get("reason", "chapter detection failed"))
-        return {"status": "failed", "reason": detection.get("reason"), "chapters": []}
+        return {"status": "failed", "reason": detection.get("reason"), "chapter_count": 0, "processed_count": 0}
 
     chapters_meta = detection["chapters"]
     report("processing_chapters", f"{len(chapters_meta)} chapter(s) detected, offset={detection['offset']}")
+    if on_chapters_detected:
+        on_chapters_detected(chapters_meta)
 
     image_cache = []  # shared across every chapter below -- a recurring image (banner,
     # footer icon) is judged by Gemini once and reused for every later occurrence,
     # matched via tolerant perceptual-hash comparison (see chapter_select.py's _find_cached).
-    processed = []
+    processed_count = 0
     for i, ch in enumerate(chapters_meta, start=1):
         report("processing_chapters", f"chapter {i}/{len(chapters_meta)}: {ch['title']}")
+        canonical = None
         try:
             canonical = process_chapter(doc, ch, book_id, images_dir, api_key, image_cache)
-            processed.append(canonical)
+            on_chapter_done(canonical)
+            processed_count += 1
         except Exception as exc:
             report("chapter_failed", f"chapter {i} '{ch['title']}' failed: {exc!r}")
+        finally:
+            canonical = None  # drop this chapter's content before the next one starts
+            gc.collect()
 
-    report("done", f"{len(processed)}/{len(chapters_meta)} chapter(s) processed")
-    return {"status": "ok", "offset": detection["offset"], "chapters": processed}
+    report("done", f"{processed_count}/{len(chapters_meta)} chapter(s) processed")
+    return {"status": "ok", "offset": detection["offset"], "chapter_count": len(chapters_meta), "processed_count": processed_count}
+
+
+def process_book(pdf_path: Path, book_id: str, images_dir: Path, api_key: str, on_progress=None) -> dict:
+    """Kept for existing local one-off scripts (e.g. run_maths_book.py) that
+    want the whole book's content back at once, published only at the end --
+    fine for a short local test, not for the real service (see
+    process_book_streaming's docstring for why). Implemented on top of it so
+    the two never drift apart."""
+    processed = []
+    result = process_book_streaming(pdf_path, book_id, images_dir, api_key, on_chapter_done=processed.append, on_progress=on_progress)
+    if result["status"] != "ok":
+        return {"status": "failed", "reason": result.get("reason"), "chapters": []}
+    return {"status": "ok", "offset": result["offset"], "chapters": processed}
