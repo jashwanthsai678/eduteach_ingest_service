@@ -36,12 +36,6 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "P
 _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
 
-# TEMPORARY, testing-only: lets a running job be told to stop between chapters,
-# to deliberately verify already-published chapters survive a partial run
-# instead of waiting for a real crash. Remove this dict, the /stop endpoint
-# below, and the should_stop wiring in _run_job once that's confirmed.
-_stop_requested: dict[str, bool] = {}
-
 
 def _update_job(job_id: str, **fields):
     with _jobs_lock:
@@ -55,7 +49,13 @@ def _run_job(job_id: str, pdf_path: Path, book_id: str, board: str, grade: str, 
     512MB OOM ceiling with NOTHING published, even though most/all chapters
     had already been extracted and paid for. With this, a crash midway
     through only loses the one chapter in flight; every chapter already
-    finished is already sitting in Supabase by the time it happens."""
+    finished is already sitting in Supabase by the time it happens.
+
+    Also resumes instead of duplicating: if this exact book_id already has
+    a book row (e.g. an earlier run got interrupted partway through), reuses
+    that book_uuid and skips chapters already published, rather than
+    creating a second book row and re-paying to reprocess chapters that had
+    already succeeded."""
     def on_progress(stage: str, detail: str):
         _update_job(job_id, stage=stage, detail=detail)
 
@@ -63,8 +63,15 @@ def _run_job(job_id: str, pdf_path: Path, book_id: str, board: str, grade: str, 
     state = {"book_uuid": None, "published_count": 0, "problem_chapters": []}
 
     def on_chapters_detected(chapters_meta):
+        existing = publish.find_existing_book(book_id)
+        if existing:
+            state["book_uuid"], already_done = existing
+            state["published_count"] = len(already_done)
+            _update_job(job_id, stage="publishing", detail=f"Resuming existing book -- {len(already_done)}/{len(chapters_meta)} chapter(s) already published")
+            return already_done
         _update_job(job_id, stage="publishing", detail="Creating book record")
         state["book_uuid"] = publish.create_book_row(pdf_path, book_id, board, grade, subject, language, school_id, len(chapters_meta))
+        return set()
 
     def on_chapter_done(canonical):
         status = publish.publish_one_chapter(state["book_uuid"], book_id, school_id, canonical, uploaded_cache)
@@ -78,15 +85,7 @@ def _run_job(job_id: str, pdf_path: Path, book_id: str, board: str, grade: str, 
         result = pipeline.process_book_streaming(
             pdf_path, book_id, IMAGES_DIR / job_id, OPENROUTER_API_KEY,
             on_chapter_done=on_chapter_done, on_chapters_detected=on_chapters_detected, on_progress=on_progress,
-            should_stop=lambda: _stop_requested.get(job_id, False),  # TEMPORARY, testing-only
         )
-
-        if result["status"] == "stopped":  # TEMPORARY, testing-only
-            _update_job(
-                job_id, status="stopped", book_uuid=state["book_uuid"], book_id=book_id,
-                chapter_count=state["published_count"], problem_chapters=state["problem_chapters"],
-            )
-            return
 
         if result["status"] != "ok":
             # Chapter detection itself failed -- nothing could have been published yet either way.
@@ -107,7 +106,6 @@ def _run_job(job_id: str, pdf_path: Path, book_id: str, board: str, grade: str, 
         )
     finally:
         pdf_path.unlink(missing_ok=True)
-        _stop_requested.pop(job_id, None)  # TEMPORARY, testing-only
 
 
 @app.get("/")
@@ -151,19 +149,3 @@ async def get_job(job_id: str):
     if job is None:
         raise HTTPException(404, f"unknown job_id {job_id!r}")
     return job
-
-
-# TEMPORARY, testing-only: lets a running job be stopped between chapters, to
-# deliberately verify already-published chapters survive a partial run instead
-# of waiting for a real crash. Remove this endpoint (and _stop_requested,
-# and the should_stop wiring above) once that's confirmed.
-@app.post("/jobs/{job_id}/stop")
-async def stop_job(job_id: str):
-    with _jobs_lock:
-        job = _jobs.get(job_id)
-    if job is None:
-        raise HTTPException(404, f"unknown job_id {job_id!r}")
-    if job.get("status") != "processing":
-        raise HTTPException(400, f"job is {job.get('status')!r}, not currently processing")
-    _stop_requested[job_id] = True
-    return {"job_id": job_id, "stop_requested": True}

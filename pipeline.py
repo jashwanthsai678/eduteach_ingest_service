@@ -207,7 +207,7 @@ def process_chapter(doc, ch: dict, book_id: str, images_dir: Path, api_key: str,
 
 def process_book_streaming(
     pdf_path: Path, book_id: str, images_dir: Path, api_key: str,
-    on_chapter_done, on_chapters_detected=None, on_progress=None, should_stop=None,
+    on_chapter_done, on_chapters_detected=None, on_progress=None,
 ) -> dict:
     """Same detection + per-chapter logic as process_book(), but never holds
     more than one chapter's content in memory at a time -- confirmed
@@ -227,16 +227,15 @@ def process_book_streaming(
 
     on_chapters_detected(chapters_meta), if given, is called once right
     after chapter detection succeeds, before any chapter is processed --
-    lets the caller create the Supabase book row at the right time, with a
-    known chapter_count, before any per-chapter publish call needs it.
-
-    should_stop(), if given, is checked before starting each new chapter --
-    if it returns True, the loop ends immediately without starting that
-    chapter. TEMPORARY, testing-only: exists to deliberately trigger a
-    controlled "stop partway through" instead of waiting for a real crash,
-    to confirm already-published chapters really do survive. Remove once
-    that's confirmed working -- see main.py's /jobs/{job_id}/stop endpoint,
-    also marked temporary."""
+    lets the caller create (or find an existing) Supabase book row at the
+    right time, with a known chapter_count, before any per-chapter publish
+    call needs it. It may return a set/iterable of chapter indices to skip
+    (already published from an earlier, interrupted run of this same book)
+    -- confirmed necessary after a real run got stopped partway through and
+    a second upload of the exact same book would otherwise have created a
+    second book row and re-paid to reprocess chapters that had already
+    succeeded. Chapters in that skip set are neither re-extracted nor
+    re-published; they still count toward processed_count."""
     def report(stage, detail=""):
         if on_progress:
             on_progress(stage, detail)
@@ -250,17 +249,18 @@ def process_book_streaming(
 
     chapters_meta = detection["chapters"]
     report("processing_chapters", f"{len(chapters_meta)} chapter(s) detected, offset={detection['offset']}")
+    skip_chapters = set()
     if on_chapters_detected:
-        on_chapters_detected(chapters_meta)
+        skip_chapters = set(on_chapters_detected(chapters_meta) or ())
 
     image_cache = []  # shared across every chapter below -- a recurring image (banner,
     # footer icon) is judged by Gemini once and reused for every later occurrence,
     # matched via tolerant perceptual-hash comparison (see chapter_select.py's _find_cached).
-    processed_count = 0
+    processed_count = len(skip_chapters)
     for i, ch in enumerate(chapters_meta, start=1):
-        if should_stop and should_stop():  # TEMPORARY, testing-only -- see docstring
-            report("stopped", f"stopped after {processed_count}/{len(chapters_meta)} chapter(s)")
-            return {"status": "stopped", "offset": detection["offset"], "chapter_count": len(chapters_meta), "processed_count": processed_count}
+        if ch["index"] in skip_chapters:
+            report("processing_chapters", f"chapter {i}/{len(chapters_meta)}: '{ch['title']}' already published, skipping")
+            continue
 
         report("processing_chapters", f"chapter {i}/{len(chapters_meta)}: {ch['title']}")
         canonical = None

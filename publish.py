@@ -35,6 +35,29 @@ def _sb_insert(table: str, rows: list[dict]) -> list[dict]:
     return resp.json()
 
 
+def _sb_get(table: str, **params) -> list[dict]:
+    resp = requests.get(f"{SUPABASE_URL}/rest/v1/{table}", headers=HEADERS, params=params, timeout=30)
+    if not resp.ok:
+        raise RuntimeError(f"query on {table} failed ({resp.status_code}): {resp.text}")
+    return resp.json()
+
+
+def find_existing_book(book_id: str) -> tuple[str, set[int]] | None:
+    """Checks whether this exact book_id already has a book row in Supabase
+    -- confirmed necessary after a stopped-partway-through book was
+    re-uploaded and would otherwise have created a second book row and
+    re-paid to reprocess chapters that had already succeeded. Returns
+    (book_uuid, {already-published chapter numbers}) if the book row
+    exists, or None if this is genuinely a new book."""
+    books = _sb_get("textbook_books", book_id=f"eq.{book_id}", select="id")
+    if not books:
+        return None
+    book_uuid = books[0]["id"]
+    chapters = _sb_get("textbook_chapters", book_uuid=f"eq.{book_uuid}", select="chapter_number")
+    done = {row["chapter_number"] for row in chapters}
+    return book_uuid, done
+
+
 def compress_and_upload_image(image_path: Path, storage_key: str) -> tuple[str, int, int, int]:
     with Image.open(image_path) as im:
         im = im.convert("RGB")
