@@ -13,6 +13,95 @@ import chapter_select as sel
 import toc_detect
 
 
+_FRAGMENT_MAX_AREA = 10000  # pt^2 (100x100pt) -- comfortably above a real standalone photo/diagram's
+# usual size; a small image block only counts as a possible fragment if it's under this.
+_FRAGMENT_CLUSTER_GAP = 20  # pt -- how close two small image bboxes must be to count as one cluster
+_FRAGMENT_MIN_CLUSTER_SIZE = 3  # only merge once several pieces cluster tightly -- same threshold
+# Phase 1's merge_fragmented_images validated (build_chapters.py) -- avoids merging two genuinely
+# separate small icons/bullets that just happen to sit near each other on the page.
+
+
+def _bbox_area(bbox: list) -> float:
+    return max(0, bbox[2] - bbox[0]) * max(0, bbox[3] - bbox[1])
+
+
+def _merge_fragmented_images(blocks: list[dict]) -> list[dict]:
+    """A real, observed PDF-encoding artifact: one embedded picture sometimes gets split
+    into hundreds or thousands of small tiled image XObjects instead of one (confirmed live
+    -- a Render free-tier OOM crash traced to one chapter with ~3,638 image blocks that
+    should have been a single photo). Every one of those fragments becomes its own block,
+    its own bbox, its own render -- the actual driver of that memory blowup, independent of
+    which Gemini tier each fragment would have hit.
+
+    Purely geometric fix, no vision call needed (unlike Phase 1's merge_fragmented_images,
+    which merges visually-separate figures like individual portraits in a family tree and so
+    needs a model to confirm they're meant to be read as one image) -- here the pieces are
+    already known to be slices of one image, a PDF structural artifact, so clustering small
+    image blocks by proximity and collapsing each qualifying cluster to one block spanning
+    their union bbox is enough. Runs before any tiny/QR/LLM tier ever sees the individual
+    pieces, so both the block count AND every downstream render/API call collapse with it.
+    Leaves isolated small blocks (clusters under _FRAGMENT_MIN_CLUSTER_SIZE) untouched -- a
+    single small icon still goes through the normal per-image path unaffected."""
+    by_page: dict[int, list[int]] = {}
+    for i, b in enumerate(blocks):
+        by_page.setdefault(b["page"], []).append(i)
+
+    to_remove = set()
+    replacements = {}
+
+    for page, idxs in by_page.items():
+        img_idxs = [i for i in idxs if blocks[i]["type"] == "image" and _bbox_area(blocks[i]["bbox"]) <= _FRAGMENT_MAX_AREA]
+        if len(img_idxs) < _FRAGMENT_MIN_CLUSTER_SIZE:
+            continue
+
+        parent = {i: i for i in img_idxs}
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def union(i, j):
+            ri, rj = find(i), find(j)
+            if ri != rj:
+                parent[ri] = rj
+
+        def expanded(bbox, g):
+            return [bbox[0] - g, bbox[1] - g, bbox[2] + g, bbox[3] + g]
+
+        def overlaps(a, b):
+            return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+        for a in range(len(img_idxs)):
+            for c in range(a + 1, len(img_idxs)):
+                i, j = img_idxs[a], img_idxs[c]
+                if overlaps(expanded(blocks[i]["bbox"], _FRAGMENT_CLUSTER_GAP), blocks[j]["bbox"]):
+                    union(i, j)
+
+        clusters: dict[int, list[int]] = {}
+        for i in img_idxs:
+            clusters.setdefault(find(i), []).append(i)
+
+        for members in clusters.values():
+            if len(members) < _FRAGMENT_MIN_CLUSTER_SIZE:
+                continue
+            keep_idx = min(members)
+            member_blocks = [blocks[i] for i in members]
+            x0 = min(b["bbox"][0] for b in member_blocks)
+            y0 = min(b["bbox"][1] for b in member_blocks)
+            x1 = max(b["bbox"][2] for b in member_blocks)
+            y1 = max(b["bbox"][3] for b in member_blocks)
+            replacements[keep_idx] = {
+                **blocks[keep_idx],
+                "bbox": [round(x0, 1), round(y0, 1), round(x1, 1), round(y1, 1)],
+                "merged_from": len(members),
+            }
+            to_remove.update(i for i in members if i != keep_idx)
+
+    return [replacements.get(i, b) for i, b in enumerate(blocks) if i not in to_remove]
+
+
 def stage5_build_blocks(doc, start_page: int, end_page: int) -> list[dict]:
     all_blocks = []
     for page_idx in range(start_page - 1, end_page):
@@ -37,7 +126,7 @@ def stage5_build_blocks(doc, start_page: int, end_page: int) -> list[dict]:
                 "block_id": f"p{page_idx+1}_b{block_no:02d}", "page": page_idx + 1, "type": "image",
                 "bbox": [round(bbox[0], 1), round(bbox[1], 1), round(bbox[2], 1), round(bbox[3], 1)], "xref": img["xref"],
             })
-    return all_blocks
+    return _merge_fragmented_images(all_blocks)
 
 
 def process_chapter(doc, ch: dict, book_id: str, images_dir: Path, api_key: str, image_cache: list | None = None) -> dict:
