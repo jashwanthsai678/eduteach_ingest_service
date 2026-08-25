@@ -207,7 +207,7 @@ def process_chapter(doc, ch: dict, book_id: str, images_dir: Path, api_key: str,
 
 def process_book_streaming(
     pdf_path: Path, book_id: str, images_dir: Path, api_key: str,
-    on_chapter_done, on_chapters_detected=None, on_progress=None,
+    on_chapter_done, on_chapters_detected=None, on_progress=None, should_stop=None,
 ) -> dict:
     """Same detection + per-chapter logic as process_book(), but never holds
     more than one chapter's content in memory at a time -- confirmed
@@ -228,7 +228,15 @@ def process_book_streaming(
     on_chapters_detected(chapters_meta), if given, is called once right
     after chapter detection succeeds, before any chapter is processed --
     lets the caller create the Supabase book row at the right time, with a
-    known chapter_count, before any per-chapter publish call needs it."""
+    known chapter_count, before any per-chapter publish call needs it.
+
+    should_stop(), if given, is checked before starting each new chapter --
+    if it returns True, the loop ends immediately without starting that
+    chapter. TEMPORARY, testing-only: exists to deliberately trigger a
+    controlled "stop partway through" instead of waiting for a real crash,
+    to confirm already-published chapters really do survive. Remove once
+    that's confirmed working -- see main.py's /jobs/{job_id}/stop endpoint,
+    also marked temporary."""
     def report(stage, detail=""):
         if on_progress:
             on_progress(stage, detail)
@@ -250,6 +258,10 @@ def process_book_streaming(
     # matched via tolerant perceptual-hash comparison (see chapter_select.py's _find_cached).
     processed_count = 0
     for i, ch in enumerate(chapters_meta, start=1):
+        if should_stop and should_stop():  # TEMPORARY, testing-only -- see docstring
+            report("stopped", f"stopped after {processed_count}/{len(chapters_meta)} chapter(s)")
+            return {"status": "stopped", "offset": detection["offset"], "chapter_count": len(chapters_meta), "processed_count": processed_count}
+
         report("processing_chapters", f"chapter {i}/{len(chapters_meta)}: {ch['title']}")
         canonical = None
         try:
