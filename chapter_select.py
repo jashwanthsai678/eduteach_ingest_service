@@ -62,6 +62,12 @@ IMAGE_JUDGE_PROMPT = (
     "captured separately as a heading block, so keeping the banner too would serve the "
     "same title twice. The giveaway: the image mostly consists of a title-sized text "
     "string as its main content, not a scene/diagram illustrating a specific lesson point.\n\n"
+    "SECOND, check: is this a QR code or barcode (a square black-and-white scannable "
+    "pattern, sometimes with a short code printed under it)? If so, ALWAYS drop it -- QR "
+    "codes link to external digital content and are never real lesson content on their "
+    "own, regardless of how visually distinct or 'important to reproduce exactly' the "
+    "pattern looks. (A deterministic check normally catches these for free before this "
+    "prompt ever runs; this rule is the backstop for the rare case it misses one.)\n\n"
     "OTHERWISE, decide between exactly three outcomes:\n"
     '- "drop": decorative page furniture (a border, a generic bullet icon, a repeated '
     "banner element) -- not real lesson content.\n"
@@ -86,8 +92,12 @@ IMAGE_JUDGE_PROMPT = (
     'Write "reason" as a caption/description a teacher could use to reference or redraw this '
     "figure WITHOUT seeing it -- describe what the image actually shows (2-4 sentences: the "
     "scene, any labeled elements, names, or values visible), not a justification for your "
-    'decision. If decision is "drop", reason can stay a brief one-line note on why it\'s '
-    "decorative.\n\n"
+    'decision. This applies to EVERY decision, including "keep_image" -- never add a closing '
+    "sentence explaining why the image needed to be kept or why a description wouldn't be "
+    "enough (e.g. avoid phrasing like 'the exact visual details are important' or 'this "
+    "requires the actual image for context') -- 'reason' is always pure descriptive caption "
+    'text, never a justification. If decision is "drop", reason can stay a brief one-line '
+    "note on why it's decorative.\n\n"
     'Return ONLY {"decision": "drop"/"keep_description_only"/"keep_image", "reason": "..."}'
 )
 
@@ -115,10 +125,18 @@ IMAGE_SCHEMA = {
 
 
 def _is_qr_code(png_bytes: bytes) -> bool:
+    """cv2's detector is unreliable on small crops -- a real QR code (~170x185px)
+    was observed slipping through undetected, reaching a paid Gemini call that then
+    had to catch it instead. Upscaling small crops before detection is the standard
+    fix for this class of detector; the IMAGE_JUDGE_PROMPT's explicit QR backstop
+    rule covers whatever this still misses."""
     arr = np.frombuffer(png_bytes, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
     if img is None:
         return False
+    if max(img.shape) < 400:
+        scale = 400 / max(img.shape)
+        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
     found, _ = cv2.QRCodeDetector().detect(img)
     return bool(found)
 
@@ -228,7 +246,20 @@ def select_image_blocks(image_blocks: list[dict], crop_fn, context_fn, api_key: 
     real recurring images almost never hash bit-for-bit identical, so this
     is a list scanned with _find_cached's tolerance instead. Pass the SAME
     list into every call for a book to get the cross-chapter benefit; omit
-    it to fall back to no caching."""
+    it to fall back to no caching.
+
+    Each returned decision also carries "_shared": for llm_visual/
+    llm_visual_cached tiers, this is the SAME dict object stored inside
+    image_cache for that hash -- every occurrence of one recurring image
+    points at one shared object. The caller (pipeline.py) uses this to
+    record the saved file's path after the FIRST occurrence crops and
+    saves it, so every later occurrence of the same image reuses that
+    exact file instead of cropping and saving a fresh (nearly-identical,
+    but not byte-identical) copy of the same picture again. Without this,
+    the judgment cache alone still avoids the Gemini cost per recurrence,
+    but not the crop/save/upload cost -- confirmed on real data: a
+    recurring illustration that appeared 4 times produced 4 separate
+    ~35KB files, all the same picture."""
     if image_cache is None:
         image_cache = []
 
@@ -249,7 +280,10 @@ def select_image_blocks(image_blocks: list[dict], crop_fn, context_fn, api_key: 
         img_hash = _perceptual_hash(crop)
         cached = _find_cached(image_cache, img_hash) if img_hash is not None else None
         if cached is not None:
-            decisions[b["block_id"]] = {**cached, "tier": "llm_visual_cached"}
+            decisions[b["block_id"]] = {
+                "keep": cached["keep"], "save_image": cached["save_image"], "reason": cached["reason"],
+                "tier": "llm_visual_cached", "_shared": cached,
+            }
             continue
         result = judge_image(crop, context_fn(b), api_key)
         decision = result.get("decision", "drop")
@@ -258,7 +292,7 @@ def select_image_blocks(image_blocks: list[dict], crop_fn, context_fn, api_key: 
             "save_image": decision == "keep_image",
             "reason": result.get("reason", ""),
         }
-        decisions[b["block_id"]] = {**judged, "tier": "llm_visual"}
+        decisions[b["block_id"]] = {**judged, "tier": "llm_visual", "_shared": judged}
         if img_hash is not None:
             image_cache.append((img_hash, judged))
 

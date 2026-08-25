@@ -112,6 +112,13 @@ def publish_phase2_book(
     }])[0]
     book_uuid = book_row["id"]
 
+    # Keyed by the LOCAL file path pipeline.py already dedup'd a recurring image
+    # down to -- multiple chapters can still reference that same local file (the
+    # cache in pipeline.py is book-wide), so without this, each chapter would
+    # upload it to Supabase Storage again as a separate object. This makes sure
+    # a given local file is only ever actually uploaded once per book.
+    uploaded_cache: dict[str, tuple] = {}
+
     for canonical in chapters:
         shaped = adapt_chapter(canonical)
         index = canonical["chapter_number"]
@@ -119,8 +126,13 @@ def publish_phase2_book(
         image_rows = []
         for i, img in enumerate(shaped["images"], start=1):
             image_id = f"img_{book_id}_ch{index:02d}_{i:02d}"
-            storage_key = f"{book_id}/ch{index:02d}/{image_id}.jpg"
-            storage_path, width, height, n_bytes = compress_and_upload_image(Path(img["path"]), storage_key)
+            local_path = img["path"]
+            if local_path in uploaded_cache:
+                storage_path, width, height, n_bytes = uploaded_cache[local_path]
+            else:
+                storage_key = f"{book_id}/ch{index:02d}/{image_id}.jpg"
+                storage_path, width, height, n_bytes = compress_and_upload_image(Path(local_path), storage_key)
+                uploaded_cache[local_path] = (storage_path, width, height, n_bytes)
             content = content.replace(f"[FIGURE {i}]", f'<img id="{image_id}" />')
             image_rows.append({
                 "school_id": school_id, "image_id": image_id, "caption": img["caption"],

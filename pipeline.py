@@ -165,14 +165,25 @@ def process_chapter(doc, ch: dict, book_id: str, images_dir: Path, api_key: str,
             if not d or not d.get("keep"):
                 continue
             if d.get("save_image", True):
-                img_path = images_dir / f"{b['block_id']}.png"
-                images_dir.mkdir(parents=True, exist_ok=True)
-                page = doc[b["page"] - 1]
-                pix = page.get_pixmap(clip=pymupdf.Rect(*b["bbox"]), dpi=150)
-                pix.save(img_path)
+                shared = d.get("_shared")
+                existing_path = shared.get("image_path") if shared else None
+                if existing_path:
+                    # Same recurring image already cropped and saved for an earlier
+                    # occurrence (this chapter or an earlier one) -- reuse that exact
+                    # file instead of saving another near-identical copy of it.
+                    image_path = existing_path
+                else:
+                    img_path = images_dir / f"{b['block_id']}.png"
+                    images_dir.mkdir(parents=True, exist_ok=True)
+                    page = doc[b["page"] - 1]
+                    pix = page.get_pixmap(clip=pymupdf.Rect(*b["bbox"]), dpi=150)
+                    pix.save(img_path)
+                    image_path = str(img_path)
+                    if shared is not None:
+                        shared["image_path"] = image_path
                 kept.append({
                     "block_id": b["block_id"], "page": b["page"], "content_type": "image", "bbox": b["bbox"],
-                    "image_path": str(img_path), "description": d.get("reason", ""),
+                    "image_path": image_path, "description": d.get("reason", ""),
                 })
             else:
                 # Content is real but simple/generic enough that the description alone
