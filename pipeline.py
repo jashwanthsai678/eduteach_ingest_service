@@ -139,7 +139,7 @@ def process_chapter(doc, ch: dict, book_id: str, images_dir: Path, api_key: str,
         by_page.setdefault(b["page"], []).append(b)
 
     text_input = [{"block_id": b["block_id"], "page": b["page"], "bbox": b["bbox"], "text": b["text"]} for b in text_blocks]
-    text_decisions = sel.select_text_blocks(text_input, api_key) if text_input else {}
+    text_decisions = sel.select_text_blocks(text_input, api_key, chapter_number=ch["index"], chapter_title=ch["title"]) if text_input else {}
 
     def crop_fn(b):
         page = doc[b["page"] - 1]
@@ -160,7 +160,14 @@ def process_chapter(doc, ch: dict, book_id: str, images_dir: Path, api_key: str,
             d = text_decisions.get(b["block_id"])
             if not d or not d.get("keep"):
                 continue
-            kept.append({"block_id": b["block_id"], "page": b["page"], "content_type": d["type"], "bbox": b["bbox"], "text": b["text"]})
+            text = b["text"]
+            if d["type"] == "heading" and d.get("topic_number"):
+                # Missing/inconsistent/out-of-order subtopic numbering, corrected --
+                # only ever set for genuine subtopics, never recurring section labels
+                # like "Do These" (see select_text_blocks' docstring). Already-correct
+                # numbering comes back as "" and the original heading text is untouched.
+                text = f"{d['topic_number']}. {text}"
+            kept.append({"block_id": b["block_id"], "page": b["page"], "content_type": d["type"], "bbox": b["bbox"], "text": text})
         else:
             d = image_decisions.get(b["block_id"])
             if not d or not d.get("keep"):

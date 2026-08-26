@@ -41,7 +41,7 @@ _HASH_HAMMING_THRESHOLD = 8  # out of 144 bits -- same tolerance Phase 1 validat
 MODEL = "google/gemini-2.5-flash"
 _API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-TEXT_SELECT_PROMPT = """You are looking at the TEXT blocks of one textbook chapter, page by page. Each has a block_id, page, bbox, and its actual extracted text.
+TEXT_SELECT_PROMPT_TEMPLATE = """You are looking at the TEXT blocks of chapter {chapter_number} of one textbook, page by page, in the order they actually appear. Each has a block_id, page, bbox, and its actual extracted text. This chapter's own known title is: "{chapter_title}".
 
 Classify each block:
 - "concept": explains/teaches an idea
@@ -49,7 +49,33 @@ Classify each block:
 - "noise": running headers/footers, page numbers, decorative bars, front matter -- not real content
 - "heading": a section/topic heading
 
-Return ONLY a JSON array: [{"block_id": ..., "type": ..., "keep": true/false}], one per block_id given.
+ADDITIONALLY, for every block classified "heading": decide whether it is a GENUINE SUBTOPIC
+heading -- a real, distinct section of the chapter's subject matter (e.g. "Rectangle", "Square",
+"2.1 Rules of the Games") -- as opposed to:
+- a RECURRING SECTION LABEL that appears multiple times across the chapter as a generic
+  activity/exercise marker (e.g. "Do These", "Think and Discuss", "Exercise", "Key words",
+  "Try This", "What have we learnt?"), or
+- the CHAPTER'S OWN TITLE ("{chapter_title}") itself, or a fragment/piece of it -- large
+  chapter-opener titles are sometimes split across two or more separate blocks purely because of
+  page layout/font differences (e.g. "CHANGING FAMILY" and "STRUCTURE" as two blocks that
+  together spell the one title "CHANGING FAMILY STRUCTURE"). Any block that is this title, or
+  part of it, is the chapter's own name, not a subtopic of it.
+Neither recurring section labels nor the chapter's own title/title-fragments are subtopics --
+they never get a topic_number, and they must NOT be counted when determining subtopic sequence.
+
+For each GENUINE SUBTOPIC heading, check whether the chapter's subtopic headings, in the order
+they actually appear, already carry clean, correctly SEQUENTIAL numbers (e.g. {chapter_number}.1,
+then {chapter_number}.2, then {chapter_number}.3 -- no gaps, no repeats, no out-of-order jumps).
+If they already do, set "topic_number" to an empty string "" -- it's already correct, leave it
+alone. If numbering is missing entirely, inconsistent, or out of order, set "topic_number" to the
+CORRECT sequential number this heading should have, formatted as "{chapter_number}.N" (e.g.
+"{chapter_number}.1", "{chapter_number}.2"), counting only genuine subtopics in the order they
+actually appear in the chapter -- not the order any existing broken numbers might suggest.
+
+For every block that is not a genuine subtopic heading (including recurring section labels, the
+chapter's own title, and every non-heading block), "topic_number" is always "".
+
+Return ONLY a JSON array: [{{"block_id": ..., "type": ..., "keep": true/false, "topic_number": ...}}], one per block_id given.
 """
 
 IMAGE_JUDGE_PROMPT = (
@@ -131,8 +157,9 @@ TEXT_SCHEMA = {
             "block_id": {"type": "string"},
             "type": {"type": "string", "enum": ["concept", "activity", "noise", "heading"]},
             "keep": {"type": "boolean"},
+            "topic_number": {"type": "string"},
         },
-        "required": ["block_id", "type", "keep"],
+        "required": ["block_id", "type", "keep", "topic_number"],
     },
 }
 
@@ -215,13 +242,24 @@ def _call_with_retry(payload: dict, api_key: str, timeout: int, max_attempts: in
     raise last_exc
 
 
-def select_text_blocks(text_blocks: list[dict], api_key: str) -> dict:
-    """text_blocks: [{block_id, page, bbox, text}]. Returns {block_id: {type, keep}}."""
+def select_text_blocks(text_blocks: list[dict], api_key: str, chapter_number: int = 1, chapter_title: str = "") -> dict:
+    """text_blocks: [{block_id, page, bbox, text}]. Returns {block_id: {type, keep, topic_number}}.
+
+    topic_number is "" for everything except genuine subtopic headings (never
+    for recurring section labels like "Do These"/"Think and Discuss", and
+    never for non-heading blocks) -- non-empty only when that heading's
+    numbering is missing/inconsistent/out of order and needs a correct
+    sequence number attached (e.g. "3.1"); empty when the chapter's existing
+    numbering is already correct and should be left alone. Rides along in
+    this same call rather than a separate one -- the model already has every
+    heading in the chapter, in order, as part of classifying blocks in the
+    first place, so this costs nothing extra to ask for."""
     if not text_blocks:
         return {}
+    prompt = TEXT_SELECT_PROMPT_TEMPLATE.format(chapter_number=chapter_number, chapter_title=chapter_title)
     payload = {
         "model": MODEL,
-        "messages": [{"role": "user", "content": TEXT_SELECT_PROMPT + "\n\n" + json.dumps(text_blocks, ensure_ascii=False)}],
+        "messages": [{"role": "user", "content": prompt + "\n\n" + json.dumps(text_blocks, ensure_ascii=False)}],
         "response_format": {"type": "json_schema", "json_schema": {"name": "selection", "schema": TEXT_SCHEMA}},
     }
     decisions = _call_with_retry(payload, api_key, timeout=120)
