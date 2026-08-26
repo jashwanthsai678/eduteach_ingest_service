@@ -106,13 +106,29 @@ def adapt_chapter(canonical: dict) -> dict:
         ctype = item["content_type"]
         if ctype == "image":
             fig_n += 1
-            images.append({"path": item["image_path"], "caption": item.get("description", ""), "page": item["page"]})
+            images.append({
+                "path": item["image_path"], "caption": item.get("description", ""),
+                "page": item["page"], "usage": item.get("usage", "direct"),
+            })
             lines.append(f"[FIGURE {fig_n}]")
         elif ctype == "image_description":
-            # Simple/generic content judged redrawable from text alone (Stage 8's
-            # keep_description_only tier) -- no file was ever cropped or saved for
-            # this one, so it has no [FIGURE n] slot and nothing to upload.
-            lines.append(f"[FIGURE DESCRIPTION] {item.get('description', '')}")
+            # Simple/generic content judged redrawable/regeneratable from text alone
+            # (Stage 8's keep_description_only tier) -- no file was ever cropped or
+            # saved for this one, but it still gets a real placeholder + row (path
+            # None, no upload) so a downstream consumer has ONE consistent lookup for
+            # every figure instead of real images being structured and these being
+            # buried as inline text.
+            fig_n += 1
+            images.append({
+                "path": None, "caption": item.get("description", ""),
+                "page": item["page"], "usage": item.get("usage", "draw"),
+            })
+            lines.append(f"[FIGURE {fig_n}]")
+        elif ctype == "image_description_ref":
+            # The SAME recurring image's description already appeared earlier in this
+            # chapter (pipeline.py's within-chapter dedup) -- no new row, no repeated
+            # paragraph, just a short pointer back to it.
+            lines.append("[FIGURE: SAME AS ABOVE]")
         elif ctype in _TAG_MAP:
             lines.append(f"[{_TAG_MAP[ctype]}] {item['text']}")
     return {
@@ -155,7 +171,14 @@ def publish_one_chapter(book_uuid: str, book_id: str, school_id: str, canonical:
     for i, img in enumerate(shaped["images"], start=1):
         image_id = f"img_{book_id}_ch{index:02d}_{i:02d}"
         local_path = img["path"]
-        if local_path in uploaded_cache:
+        if local_path is None:
+            # keep_description_only content -- no file was ever cropped or saved for it
+            # (see pipeline.py's process_chapter), so there's nothing to upload. Still gets
+            # a real row + placeholder, just with no storage_path: the API's "usage" field
+            # is what tells a downstream consumer this one has no url and must be
+            # AI-generated or hand-drawn instead of fetched.
+            storage_path, width, height, n_bytes = None, None, None, None
+        elif local_path in uploaded_cache:
             storage_path, width, height, n_bytes = uploaded_cache[local_path]
         else:
             storage_key = f"{book_id}/ch{index:02d}/{image_id}.jpg"
@@ -166,7 +189,7 @@ def publish_one_chapter(book_uuid: str, book_id: str, school_id: str, canonical:
         image_rows.append({
             "school_id": school_id, "image_id": image_id, "caption": img["caption"],
             "storage_path": storage_path, "source_page": img["page"], "width": width,
-            "height": height, "bytes": n_bytes, "order_index": i - 1,
+            "height": height, "bytes": n_bytes, "order_index": i - 1, "usage": img["usage"],
         })
 
     problems = validate_chapter(shaped, content, image_rows)

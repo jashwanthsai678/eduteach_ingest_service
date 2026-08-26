@@ -26,6 +26,28 @@ def _bbox_area(bbox: list) -> float:
     return max(0, bbox[2] - bbox[0]) * max(0, bbox[3] - bbox[1])
 
 
+def _clean_text(text: str) -> str:
+    """PyMuPDF preserves the PDF's physical line-wrap as literal '\\n' inside
+    a block's text -- e.g. "Nithya and her 5 friends are\\nplaying a game" --
+    which is just where the original page happened to wrap the line, not a
+    real paragraph break (every block here is already one classified unit;
+    real breaks between units are separate blocks). Left in, every downstream
+    reader (including whichever LLM a school's app uses to build materials
+    from this) has to silently reflow it just to read it as a sentence, on
+    every single use. Collapsing all whitespace to single spaces fixes that
+    once, for free, at ingestion. Also shortens long fill-in-the-blank
+    underscore runs ("____________") to a fixed-width placeholder -- the
+    exact count of underscores on the original worksheet line carries no
+    real information, just extra tokens."""
+    text = " ".join(text.split())
+    text = re.sub(r"_{4,}", "___", text)
+    return text
+
+
+def _normalize_heading(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", text.lower())
+
+
 def _merge_fragmented_images(blocks: list[dict]) -> list[dict]:
     """A real, observed PDF-encoding artifact: one embedded picture sometimes gets split
     into hundreds or thousands of small tiled image XObjects instead of one (confirmed live
@@ -219,7 +241,7 @@ def stage5_build_blocks(doc, start_page: int, end_page: int) -> list[dict]:
         combined = []
         for b in raw_text:
             x0, y0, x1, y1, text, bno, btype = b
-            text = text.strip()
+            text = _clean_text(text)
             if btype == 0 and text:
                 combined.append((y0, x0, "text", [x0, y0, x1, y1], text, None))
         for img in images:
@@ -267,18 +289,40 @@ def process_chapter(doc, ch: dict, book_id: str, images_dir: Path, api_key: str,
     image_decisions = sel.select_image_blocks(image_blocks, crop_fn, context_fn, api_key, image_cache) if image_blocks else {}
 
     kept = []
+    seen_first_heading = False
+    seen_desc_shared = {}  # id(shared judgment dict) -> block_id of this CHAPTER's first
+    # occurrence -- resets every call (one call per chapter) by design, so a recurring image
+    # (judged once, book-wide, via the perceptual-hash cache) only gets its full description
+    # repeated once per chapter; every later occurrence in the SAME chapter becomes a short
+    # back-reference instead of the same paragraph again. Deliberately NOT deduped across
+    # chapters -- each chapter is a separate published unit with its own content string, and
+    # "same as above" wouldn't resolve to anything in a different chapter's text.
     for b in blocks:
         if b["type"] == "text":
             d = text_decisions.get(b["block_id"])
             if not d or not d.get("keep"):
                 continue
             text = b["text"]
-            if d["type"] == "heading" and d.get("topic_number"):
-                # Missing/inconsistent/out-of-order subtopic numbering, corrected --
-                # only ever set for genuine subtopics, never recurring section labels
-                # like "Do These" (see select_text_blocks' docstring). Already-correct
-                # numbering comes back as "" and the original heading text is untouched.
-                text = f"{d['topic_number']}. {text}"
+            if d["type"] == "heading":
+                if not seen_first_heading:
+                    # The PDF sometimes renders the chapter number right after the opening
+                    # title as one continuous text run -- e.g. "Many objects - Different
+                    # shapes 1" (confirmed: PyMuPDF returns this as a single block). That
+                    # duplicates canonical["title"], which is already carried separately, so
+                    # drop this block entirely once it's confirmed to BE the title (only
+                    # after stripping the suspected stray suffix, so a real heading that
+                    # merely ends in a number is never touched).
+                    seen_first_heading = True
+                    stray_suffix = f" {ch['index']}"
+                    candidate = text[: -len(stray_suffix)].rstrip() if text.endswith(stray_suffix) else text
+                    if _normalize_heading(candidate) == _normalize_heading(ch["title"]):
+                        continue
+                if d.get("topic_number"):
+                    # Missing/inconsistent/out-of-order subtopic numbering, corrected --
+                    # only ever set for genuine subtopics, never recurring section labels
+                    # like "Do These" (see select_text_blocks' docstring). Already-correct
+                    # numbering comes back as "" and the original heading text is untouched.
+                    text = f"{d['topic_number']}. {text}"
             kept.append({"block_id": b["block_id"], "page": b["page"], "content_type": d["type"], "bbox": b["bbox"], "text": text})
         else:
             d = image_decisions.get(b["block_id"])
@@ -303,14 +347,34 @@ def process_chapter(doc, ch: dict, book_id: str, images_dir: Path, api_key: str,
                         shared["image_path"] = image_path
                 kept.append({
                     "block_id": b["block_id"], "page": b["page"], "content_type": "image", "bbox": b["bbox"],
-                    "image_path": image_path, "description": d.get("reason", ""),
+                    "image_path": image_path, "description": d.get("reason", ""), "usage": "direct",
                 })
             else:
+                shared = d.get("_shared")
+                shared_key = id(shared) if shared is not None else None
+                if shared_key is not None and shared_key in seen_desc_shared:
+                    # This exact recurring image's description already appeared earlier in
+                    # THIS chapter (e.g. the same box illustration reused for both a "corner"
+                    # and an "edge" example) -- a short back-reference instead of repeating
+                    # the same paragraph again.
+                    kept.append({
+                        "block_id": b["block_id"], "page": b["page"], "content_type": "image_description_ref",
+                        "bbox": b["bbox"],
+                    })
+                    continue
+                if shared_key is not None:
+                    seen_desc_shared[shared_key] = b["block_id"]
                 # Content is real but simple/generic enough that the description alone
                 # substitutes for the picture -- no crop, no file, no upload needed at all.
                 kept.append({
                     "block_id": b["block_id"], "page": b["page"], "content_type": "image_description",
                     "bbox": b["bbox"], "description": d.get("reason", ""),
+                    "usage": d.get("reproduction") or "draw",
+                    # "draw" (a teacher reproduces it) is the conservative default when the
+                    # model omits/leaves this blank -- safe for anything simple enough to
+                    # reach this branch at all, whereas defaulting to "generate" risks an AI
+                    # image generator garbling exact text/labels it was never confirmed to
+                    # handle reliably.
                 })
 
     kept.sort(key=lambda e: (e["page"], round(e["bbox"][1] / 10), e["bbox"][0]))

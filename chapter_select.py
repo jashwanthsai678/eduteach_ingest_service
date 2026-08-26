@@ -108,6 +108,19 @@ IMAGE_JUDGE_PROMPT = (
     "cannot faithfully reproduce, or anything where the exact visual detail matters (a "
     "specific historical picture, a data chart, a diagram whose precise layout is part of "
     "what's being taught).\n\n"
+    "IF (and only if) decision is \"keep_description_only\", ALSO set \"reproduction\" to how "
+    "this specific image should be recreated downstream:\n"
+    '- "generate": purely visual content with no embedded text/labels a viewer needs to be '
+    "exactly right -- a plain object, icon, or simple scene. Safe for an AI image generator "
+    "to recreate, since there's no text it could get wrong.\n"
+    '- "draw": the image depends on specific text, labels, or exact positions to make its '
+    "point (a labeled diagram, an arrow pointing at a named part, dots at exact positions) -- "
+    "AI image generators are unreliable at rendering embedded text accurately, so a human "
+    "(teacher) reproducing it from the description is the safer, correct choice, even though "
+    "the image itself is simple enough to skip saving. When genuinely unsure between the two, "
+    'choose "draw" -- it always works, "generate" is only better when confidently safe.\n'
+    'Leave "reproduction" as an empty string "" for "drop" and "keep_image" -- it does not '
+    "apply to either.\n\n"
     "IMPORTANT EXCEPTION -- check the nearby lesson text for this before applying the "
     "simplicity test above: if the activity asks the student to COUNT something shown in "
     "the image (e.g. 'how many circles do you see'), or to TRACE, COPY, or JOIN something "
@@ -146,7 +159,8 @@ IMAGE_JUDGE_PROMPT = (
     "reasonably take 2-4 sentences to cover what's actually there, but never more than "
     "needed. If decision is \"drop\", reason can stay a brief one-line note on why it's "
     "decorative.\n\n"
-    'Return ONLY {"decision": "drop"/"keep_description_only"/"keep_image", "reason": "..."}'
+    'Return ONLY {"decision": "drop"/"keep_description_only"/"keep_image", "reason": "...", '
+    '"reproduction": "generate"/"draw"/""}'
 )
 
 TEXT_SCHEMA = {
@@ -168,8 +182,9 @@ IMAGE_SCHEMA = {
     "properties": {
         "decision": {"type": "string", "enum": ["drop", "keep_description_only", "keep_image"]},
         "reason": {"type": "string"},
+        "reproduction": {"type": "string", "enum": ["", "generate", "draw"]},
     },
-    "required": ["decision", "reason"],
+    "required": ["decision", "reason", "reproduction"],
 }
 
 
@@ -342,7 +357,7 @@ def select_image_blocks(image_blocks: list[dict], crop_fn, context_fn, api_key: 
         if cached is not None:
             decisions[b["block_id"]] = {
                 "keep": cached["keep"], "save_image": cached["save_image"], "reason": cached["reason"],
-                "tier": "llm_visual_cached", "_shared": cached,
+                "reproduction": cached.get("reproduction", ""), "tier": "llm_visual_cached", "_shared": cached,
             }
             continue
         result = judge_image(crop, context_fn(b), api_key)
@@ -351,6 +366,7 @@ def select_image_blocks(image_blocks: list[dict], crop_fn, context_fn, api_key: 
             "keep": decision in ("keep_image", "keep_description_only"),
             "save_image": decision == "keep_image",
             "reason": result.get("reason", ""),
+            "reproduction": result.get("reproduction", ""),
         }
         decisions[b["block_id"]] = {**judged, "tier": "llm_visual", "_shared": judged}
         if img_hash is not None:
