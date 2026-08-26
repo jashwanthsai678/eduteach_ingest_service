@@ -103,14 +103,23 @@ IMAGE_JUDGE_PROMPT = (
     "default does NOT apply to the title-banner check above, which is always drop regardless "
     "of uncertainty.\n\n"
     'Write "reason" as a caption/description a teacher could use to reference or redraw this '
-    "figure WITHOUT seeing it -- describe what the image actually shows (2-4 sentences: the "
-    "scene, any labeled elements, names, or values visible), not a justification for your "
-    'decision. This applies to EVERY decision, including "keep_image" -- never add a closing '
-    "sentence explaining why the image needed to be kept or why a description wouldn't be "
-    "enough (e.g. avoid phrasing like 'the exact visual details are important' or 'this "
-    "requires the actual image for context') -- 'reason' is always pure descriptive caption "
-    'text, never a justification. If decision is "drop", reason can stay a brief one-line '
-    "note on why it's decorative.\n\n"
+    "figure WITHOUT seeing it -- describe what the image actually shows (the scene, any "
+    "labeled elements, names, or values visible), not a justification for your decision. "
+    'This applies to EVERY decision, including "keep_image" -- never add a closing sentence '
+    "explaining why the image needed to be kept or why a description wouldn't be enough "
+    "(e.g. avoid phrasing like 'the exact visual details are important' or 'this requires "
+    "the actual image for context') -- 'reason' is always pure descriptive caption text, "
+    "never a justification.\n\n"
+    'MATCH THE LENGTH OF "reason" TO THE IMAGE\'S ACTUAL COMPLEXITY -- do not pad every '
+    "description out to the same length regardless of content, and do not compress a "
+    "detailed image down to something that loses what a teacher would actually need. A "
+    "simple image (one object, a basic icon, a single clear subject with nothing else "
+    "notable) should get a short, plain description, often a single sentence -- e.g. 'A "
+    "red toothpaste tube with a white cap.' A genuinely complex image (multiple distinct "
+    "elements, labels, values, or things a teacher would need to reference separately) can "
+    "reasonably take 2-4 sentences to cover what's actually there, but never more than "
+    "needed. If decision is \"drop\", reason can stay a brief one-line note on why it's "
+    "decorative.\n\n"
     'Return ONLY {"decision": "drop"/"keep_description_only"/"keep_image", "reason": "..."}'
 )
 
