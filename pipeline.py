@@ -26,6 +26,16 @@ def _bbox_area(bbox: list) -> float:
     return max(0, bbox[2] - bbox[0]) * max(0, bbox[3] - bbox[1])
 
 
+_PUA_RE = re.compile(r"[-\U000F0000-\U000FFFFD\U00100000-\U0010FFFD]")
+# Private Use Area codepoints -- confirmed on real data: some PDFs render bullet/number
+# glyphs ("7." "8." "9.") through a custom symbol font mapped into PUA codepoints, which
+# extract as meaningless characters like '' with no real text meaning outside
+# that font. Kept as-is, they're pure garbage tokens a downstream reader can't interpret;
+# stripped, the block either loses just a cosmetic numeral (its real content is elsewhere)
+# or goes empty and is dropped entirely by stage5_build_blocks -- both strictly better than
+# shipping unreadable codepoints.
+
+
 def _clean_text(text: str) -> str:
     """PyMuPDF preserves the PDF's physical line-wrap as literal '\\n' inside
     a block's text -- e.g. "Nithya and her 5 friends are\\nplaying a game" --
@@ -39,6 +49,7 @@ def _clean_text(text: str) -> str:
     underscore runs ("____________") to a fixed-width placeholder -- the
     exact count of underscores on the original worksheet line carries no
     real information, just extra tokens."""
+    text = _PUA_RE.sub("", text)
     text = " ".join(text.split())
     text = re.sub(r"_{4,}", "___", text)
     return text
@@ -46,6 +57,37 @@ def _clean_text(text: str) -> str:
 
 def _normalize_heading(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", text.lower())
+
+
+def _merge_adjacent_text(kept: list[dict]) -> list[dict]:
+    """PyMuPDF splits a page into text blocks by its own layout heuristics, not by
+    logical unit -- a single family-tree diagram's box labels, or a fill-in-the-blank
+    table's cells, routinely come back as many separate tiny blocks (confirmed on real
+    data: "Name of" / "father" / "mother" / "uncle" / "wives" each as their own block).
+    Each one was getting its own repeated "[ACTIVITY]"/"[CONCEPT]" tag -- tag overhead
+    bigger than the actual content for these fragments, and a downstream reader (or an
+    LLM building materials from this) has to mentally stitch dozens of one-word
+    "blocks" back into the one table/diagram they actually are.
+
+    Run AFTER final reading-order sort: collapses a RUN of consecutive kept entries
+    that are the SAME type (concept-with-concept, activity-with-activity) into one
+    entry, text joined by newline. Never merges across a heading, image, or a type
+    change (concept next to activity stays two tags) -- only true fragments of one
+    contiguous same-type run collapse; genuinely distinct content keeps its own tag."""
+    merged: list[dict] = []
+    for item in kept:
+        if (merged and item["content_type"] in ("concept", "activity")
+                and merged[-1]["content_type"] == item["content_type"]):
+            prev = merged[-1]
+            prev["text"] = prev["text"] + "\n" + item["text"]
+            x0 = min(prev["bbox"][0], item["bbox"][0])
+            y0 = min(prev["bbox"][1], item["bbox"][1])
+            x1 = max(prev["bbox"][2], item["bbox"][2])
+            y1 = max(prev["bbox"][3], item["bbox"][3])
+            prev["bbox"] = [round(x0, 1), round(y0, 1), round(x1, 1), round(y1, 1)]
+        else:
+            merged.append(dict(item))
+    return merged
 
 
 def _merge_fragmented_images(blocks: list[dict]) -> list[dict]:
@@ -141,6 +183,17 @@ _COLLAGE_MAX_MEMBER_AREA = 120000  # pt^2 -- a real, standalone full-scene illus
 # cap sits between the two -- comfortably above any legitimate collage piece, comfortably
 # below a real single illustration -- so an image this large always breaks/excludes itself
 # from a run, same as real separating text.
+_COLLAGE_MIN_FILL_RATIO = 0.15  # sum of member areas / the run's merged bbox area. Confirmed
+# real OOM cause: a page-wide watermark/texture pattern (thousands of ~1-2pt tiles, already
+# consolidated by _merge_fragmented_images into a handful of moderate blocks up to ~47,000pt^2
+# each) sits with no real text between pieces, so this function chained several of THOSE into
+# one "collage" spanning most of the page -- one observed run produced a 395,182pt^2 merged
+# block from members totaling only 5,290pt^2 (a 1.3% fill ratio), which then needed a
+# ~3300x3400px crop (tens of MB) sent to a real judgment call -- the actual driver of a real
+# Render OOM crash. A genuine collage's members visually fill the space they're grouped in (the
+# validated true case: 49.6% fill ratio); scattered watermark noise does not. Runs below this
+# ratio are left unmerged -- their members go through the normal per-image path individually,
+# where each (already confirmed small) piece correctly hits the free tiny-icon tier instead.
 
 
 def _merge_composite_images(blocks: list[dict]) -> list[dict]:
@@ -194,12 +247,17 @@ def _merge_composite_images(blocks: list[dict]) -> list[dict]:
                 y0 = min(b["bbox"][1] for b in member_blocks)
                 x1 = max(b["bbox"][2] for b in member_blocks)
                 y1 = max(b["bbox"][3] for b in member_blocks)
-                replacements[keep_idx] = {
-                    **blocks[keep_idx],
-                    "bbox": [round(x0, 1), round(y0, 1), round(x1, 1), round(y1, 1)],
-                    "merged_from": len(run),
-                }
-                to_remove.update(i for i in run if i != keep_idx)
+                bbox_area = max(0, x1 - x0) * max(0, y1 - y0)
+                sum_area = sum(_bbox_area(b["bbox"]) for b in member_blocks)
+                fill_ratio = (sum_area / bbox_area) if bbox_area else 1.0
+                if fill_ratio >= _COLLAGE_MIN_FILL_RATIO:
+                    replacements[keep_idx] = {
+                        **blocks[keep_idx],
+                        "bbox": [round(x0, 1), round(y0, 1), round(x1, 1), round(y1, 1)],
+                        "merged_from": len(run),
+                    }
+                    to_remove.update(i for i in run if i != keep_idx)
+                # else: scattered, not a real collage -- leave every member as its own block
             run.clear()
 
         for i in idxs:
@@ -378,6 +436,7 @@ def process_chapter(doc, ch: dict, book_id: str, images_dir: Path, api_key: str,
                 })
 
     kept.sort(key=lambda e: (e["page"], round(e["bbox"][1] / 10), e["bbox"][0]))
+    kept = _merge_adjacent_text(kept)
     for i, e in enumerate(kept, start=1):
         e["sequence"] = i
 
