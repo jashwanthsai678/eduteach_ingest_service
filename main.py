@@ -16,7 +16,7 @@ import threading
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 import pipeline
@@ -29,6 +29,8 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 IMAGES_DIR.mkdir(exist_ok=True)
 
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
+_DELETE_PASSWORD = "123456"  # a fat-finger guard, not real access control -- anyone who can
+# call this API directly can already delete a book with or without knowing this value.
 
 app = FastAPI(title="EduTeach Ingest Service (Phase 2)")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"], allow_headers=["*"])
@@ -149,3 +151,13 @@ async def get_job(job_id: str):
     if job is None:
         raise HTTPException(404, f"unknown job_id {job_id!r}")
     return job
+
+
+@app.delete("/books/{book_id}")
+async def delete_book(book_id: str, password: str = Query(...)):
+    if password != _DELETE_PASSWORD:
+        raise HTTPException(403, "Incorrect password")
+    result = publish.delete_book(book_id)
+    if result is None:
+        raise HTTPException(404, f"unknown book_id {book_id!r}")
+    return result

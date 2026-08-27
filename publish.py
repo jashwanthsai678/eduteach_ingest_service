@@ -42,6 +42,91 @@ def _sb_get(table: str, **params) -> list[dict]:
     return resp.json()
 
 
+def _sb_delete(table: str, **params) -> None:
+    resp = requests.delete(f"{SUPABASE_URL}/rest/v1/{table}", headers=HEADERS, params=params, timeout=30)
+    if not resp.ok:
+        raise RuntimeError(f"delete from {table} failed ({resp.status_code}): {resp.text}")
+
+
+def _delete_storage_prefix(prefix: str) -> int:
+    """Deletes every file under a Storage prefix (e.g. "book_id/ch01/"). Supabase's list
+    endpoint only returns the direct children of a prefix (files AND subfolders, not
+    recursively) -- book_id/ is one level (chapter folders), so this recurses one level
+    deep to reach the actual image files inside each ch0N/ folder. Returns how many files
+    were actually removed, purely for the caller to report a real count instead of
+    silently doing nothing if the prefix was already empty/wrong."""
+    resp = requests.post(
+        f"{SUPABASE_URL}/storage/v1/object/list/{_STORAGE_BUCKET}",
+        headers={**HEADERS, "Content-Type": "application/json"},
+        json={"prefix": prefix}, timeout=30,
+    )
+    if not resp.ok:
+        return 0
+    entries = resp.json()
+    file_paths = []
+    for entry in entries:
+        child = f"{prefix}/{entry['name']}" if prefix else entry["name"]
+        if entry.get("id") is None:
+            # No file id -- this entry is a folder, not a file. Recurse one level.
+            file_paths.extend(_list_storage_files(child))
+        else:
+            file_paths.append(child)
+    if not file_paths:
+        return 0
+    del_resp = requests.delete(
+        f"{SUPABASE_URL}/storage/v1/object/{_STORAGE_BUCKET}",
+        headers={**HEADERS, "Content-Type": "application/json"},
+        json={"prefixes": file_paths}, timeout=60,
+    )
+    if not del_resp.ok:
+        raise RuntimeError(f"storage delete failed ({del_resp.status_code}): {del_resp.text}")
+    return len(file_paths)
+
+
+def _list_storage_files(prefix: str) -> list[str]:
+    resp = requests.post(
+        f"{SUPABASE_URL}/storage/v1/object/list/{_STORAGE_BUCKET}",
+        headers={**HEADERS, "Content-Type": "application/json"},
+        json={"prefix": prefix}, timeout=30,
+    )
+    if not resp.ok:
+        return []
+    return [f"{prefix}/{entry['name']}" for entry in resp.json() if entry.get("id") is not None]
+
+
+def delete_book(book_id: str) -> dict | None:
+    """Cascading delete: images (rows + their uploaded Storage files) -> chapters ->
+    the book row itself, in that dependency order rather than relying on FK CASCADE
+    (not confirmed to be configured on these tables). Returns a summary dict, or None
+    if no book with this book_id exists at all -- lets the caller 404 correctly instead
+    of silently reporting success for something that was never there."""
+    books = _sb_get("textbook_books", book_id=f"eq.{book_id}", select="id")
+    if not books:
+        return None
+    book_uuid = books[0]["id"]
+
+    chapters = _sb_get("textbook_chapters", book_uuid=f"eq.{book_uuid}", select="id")
+    chapter_uuids = [c["id"] for c in chapters]
+
+    image_count = 0
+    for chapter_uuid in chapter_uuids:
+        images = _sb_get("textbook_images", chapter_uuid=f"eq.{chapter_uuid}", select="id")
+        image_count += len(images)
+        _sb_delete("textbook_images", chapter_uuid=f"eq.{chapter_uuid}")
+
+    if chapter_uuids:
+        _sb_delete("textbook_chapters", book_uuid=f"eq.{book_uuid}")
+
+    _sb_delete("textbook_books", id=f"eq.{book_uuid}")
+
+    deleted_files = _delete_storage_prefix(book_id)
+
+    return {
+        "book_id": book_id, "book_uuid": book_uuid, "chapters_deleted": len(chapter_uuids),
+        "image_rows_deleted": image_count, "storage_files_deleted": deleted_files,
+    }
+
+
 def find_existing_book(book_id: str) -> tuple[str, set[int]] | None:
     """Checks whether this exact book_id already has a book row in Supabase
     -- confirmed necessary after a stopped-partway-through book was
