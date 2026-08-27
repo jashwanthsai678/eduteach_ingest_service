@@ -141,22 +141,41 @@ IMAGE_JUDGE_PROMPT = (
     "keep_description_only when you're confident the description alone is sufficient. This "
     "default does NOT apply to the title-banner check above, which is always drop regardless "
     "of uncertainty.\n\n"
-    'Write "reason" as a caption/description a teacher could use to reference or redraw this '
-    "figure WITHOUT seeing it -- describe what the image actually shows (the scene, any "
-    "labeled elements, names, or values visible), not a justification for your decision. "
-    'This applies to EVERY decision, including "keep_image" -- never add a closing sentence '
-    "explaining why the image needed to be kept or why a description wouldn't be enough "
-    "(e.g. avoid phrasing like 'the exact visual details are important' or 'this requires "
-    "the actual image for context') -- 'reason' is always pure descriptive caption text, "
-    "never a justification.\n\n"
-    'MATCH THE LENGTH OF "reason" TO THE IMAGE\'S ACTUAL COMPLEXITY -- do not pad every '
-    "description out to the same length regardless of content, and do not compress a "
-    "detailed image down to something that loses what a teacher would actually need. A "
+    'HOW TO WRITE "reason" DIFFERS BY DECISION -- it is never a justification for your '
+    "decision in any case (never phrasing like 'the exact visual details are important' or "
+    "'this requires the actual image for context'), but its actual content and audience "
+    "differ:\n\n"
+    'For "keep_image": a plain, objective caption describing what the image actually shows '
+    "(the scene, any labeled elements, names, or values visible) -- a teacher could use it to "
+    "reference the figure without needing to look at the file. Nothing more.\n\n"
+    'For "keep_description_only": "reason" is a REPRODUCTION INSTRUCTION, not a passive '
+    "caption -- it has to actually work for whoever uses it to recreate this image, and its "
+    "style depends on which \"reproduction\" you chose:\n"
+    '- If "draw": write it as simple, blackboard-friendly guidance a teacher can sketch '
+    "quickly by hand in class -- what shapes/figures to draw and roughly how they're "
+    "arranged. Skip exact colors or fine texture detail a hand sketch can't capture anyway.\n"
+    '- If "generate": write it as a fuller visual prompt suitable for an AI image generator '
+    "-- color, style, and composition are fine here, since a generator can actually render "
+    "them.\n"
+    "GROUND the instruction in the nearby lesson text when this image specifically "
+    "illustrates what's being taught right there (e.g. text about grandparents living with "
+    "grandchildren, next to an image of exactly that -- say so explicitly: 'a grandfather "
+    "with two grandchildren, illustrating a joint family caring for children together', not "
+    "just 'an old man with two children'). This keeps a redraw or regeneration on-topic "
+    "instead of drifting into something that merely resembles the original but no longer "
+    "serves the lesson. If the image is genuinely generic supporting art with no specific "
+    "tie to the surrounding content (could illustrate almost any lesson -- a stock 'child "
+    "writing in a notebook' scene, a generic 'people discussing' scene with nothing tying it "
+    "to this specific topic), do not invent a false connection to sound more relevant than it "
+    "is -- give the plain, honest instruction for what to draw/generate instead.\n\n"
+    'MATCH THE LENGTH OF "reason" TO THE IMAGE\'S ACTUAL COMPLEXITY, for both cases above -- '
+    "do not pad every description out to the same length regardless of content, and do not "
+    "compress a detailed image down to something that loses what's actually needed. A "
     "simple image (one object, a basic icon, a single clear subject with nothing else "
     "notable) should get a short, plain description, often a single sentence -- e.g. 'A "
     "red toothpaste tube with a white cap.' A genuinely complex image (multiple distinct "
-    "elements, labels, values, or things a teacher would need to reference separately) can "
-    "reasonably take 2-4 sentences to cover what's actually there, but never more than "
+    "elements, labels, values, or things that need to be referenced separately) can "
+    "reasonably take 2-4 sentences to cover what's actually needed, but never more than "
     "needed. If decision is \"drop\", reason can stay a brief one-line note on why it's "
     "decorative.\n\n"
     'Return ONLY {"decision": "drop"/"keep_description_only"/"keep_image", "reason": "...", '
