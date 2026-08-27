@@ -59,6 +59,33 @@ def _normalize_heading(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", text.lower())
 
 
+_MERGEABLE_TEXT_TYPES = {"concept", "activity", "textbook_question", "key_words", "summary"}
+_SENTENCE_END_RE = re.compile(r'[.?!:;"\')\]]$')
+
+
+def _join_text(prev_text: str, next_text: str) -> str:
+    """Two blocks being merged are sometimes genuinely separate lines (two dialogue
+    turns, two distinct activity items) and sometimes just ONE sentence the PDF split
+    into two raw text objects purely from page layout -- confirmed real case: "who is
+    this girl in half" / "sari?" as two separate blocks, which a blanket newline-join
+    turns into "in half\\nsari?", breaking the sentence mid-word. Rejoin as a
+    continuation (space, or no space for a hyphenated line-break) only when prev_text
+    doesn't already end a sentence AND next_text starts lowercase -- both signals
+    needed together, since either alone is too weak (many real activity fragments
+    start lowercase after a real line break, e.g. list continuations)."""
+    prev_text = prev_text.rstrip()
+    if not next_text:
+        return prev_text
+    looks_like_continuation = (
+        not _SENTENCE_END_RE.search(prev_text) and next_text[:1].islower()
+    )
+    if prev_text.endswith("-") and looks_like_continuation:
+        return prev_text[:-1] + next_text  # dehyphenate a word split across a line break
+    if looks_like_continuation:
+        return prev_text + " " + next_text
+    return prev_text + "\n" + next_text
+
+
 def _merge_adjacent_text(kept: list[dict]) -> list[dict]:
     """PyMuPDF splits a page into text blocks by its own layout heuristics, not by
     logical unit -- a single family-tree diagram's box labels, or a fill-in-the-blank
@@ -70,16 +97,16 @@ def _merge_adjacent_text(kept: list[dict]) -> list[dict]:
     "blocks" back into the one table/diagram they actually are.
 
     Run AFTER final reading-order sort: collapses a RUN of consecutive kept entries
-    that are the SAME type (concept-with-concept, activity-with-activity) into one
-    entry, text joined by newline. Never merges across a heading, image, or a type
-    change (concept next to activity stays two tags) -- only true fragments of one
-    contiguous same-type run collapse; genuinely distinct content keeps its own tag."""
+    that are the SAME type into one entry (see _join_text for how the two texts get
+    joined). Never merges across a heading, image, or a type change (concept next to
+    activity stays two tags) -- only true fragments of one contiguous same-type run
+    collapse; genuinely distinct content keeps its own tag."""
     merged: list[dict] = []
     for item in kept:
-        if (merged and item["content_type"] in ("concept", "activity")
+        if (merged and item["content_type"] in _MERGEABLE_TEXT_TYPES
                 and merged[-1]["content_type"] == item["content_type"]):
             prev = merged[-1]
-            prev["text"] = prev["text"] + "\n" + item["text"]
+            prev["text"] = _join_text(prev["text"], item["text"])
             x0 = min(prev["bbox"][0], item["bbox"][0])
             y0 = min(prev["bbox"][1], item["bbox"][1])
             x1 = max(prev["bbox"][2], item["bbox"][2])

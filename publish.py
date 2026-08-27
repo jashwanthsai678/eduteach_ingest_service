@@ -24,7 +24,10 @@ _STORAGE_BUCKET = "textbook-images"
 _MAX_IMAGE_DIMENSION = 1600
 _JPEG_QUALITY = 70  # same value paddle_ocr_vl/publish_book.py settled on after measuring real compression results
 
-_TAG_MAP = {"heading": "HEADING", "concept": "CONCEPT", "activity": "ACTIVITY"}
+_TAG_MAP = {
+    "heading": "HEADING", "concept": "CONCEPT", "activity": "ACTIVITY",
+    "key_words": "KEY WORDS", "summary": "WHAT HAVE WE LEARNT", "textbook_question": "TEXTBOOK QUESTION",
+}
 
 
 def _sb_insert(table: str, rows: list[dict]) -> list[dict]:

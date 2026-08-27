@@ -45,9 +45,24 @@ TEXT_SELECT_PROMPT_TEMPLATE = """You are looking at the TEXT blocks of chapter {
 
 Classify each block:
 - "concept": explains/teaches an idea
-- "activity": a task/question/exercise the student does
+- "activity": a task/question/exercise the student does, as part of the lesson itself
 - "noise": running headers/footers, page numbers, decorative bars, front matter -- not real content
 - "heading": a section/topic heading
+- "key_words": the recurring end-of-chapter glossary/key-terms list (often labelled "Key
+  words" or similar) -- a short list of this chapter's important terms.
+- "summary": the recurring end-of-chapter bullet-point recap (often labelled "What have we
+  learnt?" or similar) -- short statements restating the chapter's main points.
+- "textbook_question": part of the chapter's FORMAL, clearly-delineated closing assessment
+  section -- typically comes after key_words/summary, often organized under this series'
+  standard competency headings repeated every chapter ("Conceptual Understanding",
+  "Questioning - Hypotheses", "Experiments - Field Observations", "Information Skills,
+  Projects", "Communication through Mapping Skills, Drawing Pictures and Making Models",
+  "Appreciation, Values and Awareness"), or simply a block under an explicit "Exercise"/
+  "Questions" recurring section label. Use this ONLY for that formal, position-clear closing
+  block -- an ordinary in-lesson activity/question earlier in the chapter (e.g. "Discuss in
+  groups", "Think and Discuss", a question embedded mid-lesson) stays "activity" even though
+  it's also phrased as a question. The signal is being part of the chapter's clearly-marked
+  closing assessment, not just "is this a question."
 
 ADDITIONALLY, for every block classified "heading": decide whether it is a GENUINE SUBTOPIC
 heading -- a real, distinct section of the chapter's subject matter (e.g. "Rectangle", "Square",
@@ -206,7 +221,7 @@ TEXT_SCHEMA = {
         "type": "object",
         "properties": {
             "block_id": {"type": "string"},
-            "type": {"type": "string", "enum": ["concept", "activity", "noise", "heading"]},
+            "type": {"type": "string", "enum": ["concept", "activity", "noise", "heading", "key_words", "summary", "textbook_question"]},
             "keep": {"type": "boolean"},
             "topic_number": {"type": "string"},
         },
