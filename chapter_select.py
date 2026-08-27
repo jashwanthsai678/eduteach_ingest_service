@@ -38,6 +38,12 @@ _HASH_HAMMING_THRESHOLD = 8  # out of 144 bits -- same tolerance Phase 1 validat
 # observed false positives across a full book; an exact-match hash would only catch
 # byte-identical crops and miss the common case of the same banner/icon recurring with
 # minor pixel differences (a different page number baked in, slight compression variance).
+_COLOR_GRID = 6  # 6x6, in color -- coarse enough to tolerate compression noise, fine enough
+# to catch a genuine recolor of the same shape (see _color_signature).
+_COLOR_MAX_MEAN_DIFF = 20  # out of 255 per B/G/R channel -- validated against real data: a
+# genuinely recurring banner (same crop, different page) differs by ~0-2; two crops that
+# are the same shape but a different color scheme differ by 50+. 20 sits comfortably below
+# a real recolor and comfortably above ordinary compression/anti-aliasing noise.
 MODEL = "google/gemini-2.5-flash"
 _API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -268,7 +274,13 @@ def _perceptual_hash(png_bytes: bytes) -> np.ndarray | None:
     Hamming distance, not exact equality -- real recurring images vary by
     a few pixels between occurrences (a different page number baked into
     the same banner, minor compression differences), so an exact-match
-    hash would miss almost all of them."""
+    hash would miss almost all of them.
+
+    Grayscale-only, so on its own this can't tell two images apart that
+    share the same shapes/composition but differ in color (e.g. the same
+    line-art icon recolored for a different section) -- that's what
+    _color_signature below is for; the two are checked together in
+    _find_cached, never on their own."""
     arr = np.frombuffer(png_bytes, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
     if img is None:
@@ -277,10 +289,31 @@ def _perceptual_hash(png_bytes: bytes) -> np.ndarray | None:
     return (small > small.mean()).flatten()
 
 
-def _find_cached(image_cache: list, img_hash: np.ndarray) -> dict | None:
-    for cached_hash, judged in image_cache:
-        if np.count_nonzero(img_hash != cached_hash) <= _HASH_HAMMING_THRESHOLD:
-            return judged
+def _color_signature(png_bytes: bytes) -> np.ndarray | None:
+    """A coarse color fingerprint -- average B/G/R per cell of a small 6x6 grid (108
+    values), closing the one real gap _perceptual_hash has on its own: it's grayscale,
+    so a recolored version of the same shape would otherwise hash identically and get
+    wrongly treated as the same recurring image, silently reusing a judgment that was
+    never actually made for this specific (differently-colored) picture. Compared by
+    mean absolute difference, not exact match, for the same reason the shape hash uses
+    a tolerance -- real recurring images vary slightly between occurrences (JPEG
+    compression noise, a different page number baked in)."""
+    arr = np.frombuffer(png_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    small = cv2.resize(img, (_COLOR_GRID, _COLOR_GRID), interpolation=cv2.INTER_AREA)
+    return small.astype(np.float32).flatten()
+
+
+def _find_cached(image_cache: list, img_hash: np.ndarray, color_sig: np.ndarray | None) -> dict | None:
+    for cached_hash, cached_color, judged in image_cache:
+        if np.count_nonzero(img_hash != cached_hash) > _HASH_HAMMING_THRESHOLD:
+            continue
+        if color_sig is not None and cached_color is not None:
+            if float(np.abs(color_sig - cached_color).mean()) > _COLOR_MAX_MEAN_DIFF:
+                continue  # same shape, different color -- not actually the same image
+        return judged
     return None
 
 
@@ -415,7 +448,8 @@ def select_image_blocks(image_blocks: list[dict], crop_fn, context_fn, api_key: 
 
     for b, crop in to_judge:
         img_hash = _perceptual_hash(crop)
-        cached = _find_cached(image_cache, img_hash) if img_hash is not None else None
+        color_sig = _color_signature(crop)
+        cached = _find_cached(image_cache, img_hash, color_sig) if img_hash is not None else None
         if cached is not None:
             decisions[b["block_id"]] = {
                 "keep": cached["keep"], "save_image": cached["save_image"], "reason": cached["reason"],
@@ -432,6 +466,6 @@ def select_image_blocks(image_blocks: list[dict], crop_fn, context_fn, api_key: 
         }
         decisions[b["block_id"]] = {**judged, "tier": "llm_visual", "_shared": judged}
         if img_hash is not None:
-            image_cache.append((img_hash, judged))
+            image_cache.append((img_hash, color_sig, judged))
 
     return decisions
