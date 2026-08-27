@@ -92,13 +92,26 @@ IMAGE_JUDGE_PROMPT = (
     "activity block, so keeping the banner too would serve the same label twice. The "
     "giveaway: the image mostly consists of a short heading-sized text string as its main "
     "content (whether the chapter's title or a recurring section name), not a scene/diagram "
-    "illustrating a specific lesson point.\n\n"
+    "illustrating a specific lesson point. THIS RULE ONLY APPLIES WHEN THE BANNER IS "
+    "ESSENTIALLY THE WHOLE IMAGE -- if the crop ALSO contains a distinct illustrated scene "
+    "(people, objects, a diagram) occupying real space alongside a title/QR/label element, "
+    "this is a MIXED crop, not a pure banner: do NOT drop it on this rule. Judge the real "
+    "scene on its own merits (drop/keep_description_only/keep_image per the normal criteria "
+    "below) and simply ignore the incidental title/QR/label sharing the crop -- never let a "
+    "small title or QR code sharing space with real content cause the real content to be "
+    "thrown away too. A confirmed real case: a chapter's title banner, its QR code, and its "
+    "actual opening illustration (a family looking at a photo) all ended up in one merged "
+    "crop with no separating text -- the correct decision keeps the illustration; dropping "
+    "the whole crop because a title happened to share the frame lost real, important content.\n\n"
     "SECOND, check: is this a QR code or barcode (a square black-and-white scannable "
     "pattern, sometimes with a short code printed under it)? If so, ALWAYS drop it -- QR "
     "codes link to external digital content and are never real lesson content on their "
     "own, regardless of how visually distinct or 'important to reproduce exactly' the "
-    "pattern looks. (A deterministic check normally catches these for free before this "
-    "prompt ever runs; this rule is the backstop for the rare case it misses one.)\n\n"
+    "pattern looks -- UNLESS (same MIXED-crop exception as above) real illustrated content "
+    "shares the crop with it, in which case judge that real content normally and ignore the "
+    "QR code. (A deterministic check normally catches a standalone QR code for free before "
+    "this prompt ever runs; this rule is the backstop for the rare case it misses one, or "
+    "for a merged crop the deterministic check correctly skipped for exactly this reason.)\n\n"
     "OTHERWISE, decide between exactly three outcomes:\n"
     '- "drop": decorative page furniture (a border, a generic bullet icon, a repeated '
     "banner element) -- not real lesson content.\n"
@@ -370,7 +383,17 @@ def select_image_blocks(image_blocks: list[dict], crop_fn, context_fn, api_key: 
             decisions[b["block_id"]] = {"keep": False, "save_image": False, "reason": "tiny icon (<1600px^2), free tier", "tier": "tiny"}
             continue
         crop = crop_fn(b)
-        if _is_qr_code(crop):
+        # merged_from means this crop is the union of several original blocks (fragment or
+        # composite merge) -- _is_qr_code's cv2 detector fires on ANY QR pattern found
+        # anywhere in the crop, not just a crop that's PURELY a QR code, so a merged block
+        # containing a real QR code alongside unrelated real content (confirmed real case:
+        # a chapter's title/QR/icon composite-merged with its actual opening illustration,
+        # with no real text between them) was being dropped whole for free, losing the real
+        # illustration along with the QR code. Only apply this free tier to a genuinely
+        # unmerged, standalone block; a merged one always goes to the real judgment call,
+        # where the prompt's QR backstop rule can correctly separate "drop the QR part" from
+        # "keep the real content" instead of an all-or-nothing pixel-pattern check.
+        if not b.get("merged_from") and _is_qr_code(crop):
             decisions[b["block_id"]] = {"keep": False, "save_image": False, "reason": "QR code, free tier", "tier": "qr"}
         else:
             to_judge.append((b, crop))

@@ -33,7 +33,7 @@ _DELETE_PASSWORD = "123456"  # a fat-finger guard, not real access control -- an
 # call this API directly can already delete a book with or without knowing this value.
 
 app = FastAPI(title="EduTeach Ingest Service (Phase 2)")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST", "DELETE"], allow_headers=["*"])
 
 _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()

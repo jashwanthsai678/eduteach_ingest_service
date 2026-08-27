@@ -281,10 +281,24 @@ def _merge_composite_images(blocks: list[dict]) -> list[dict]:
     return [replacements.get(i, b) for i, b in enumerate(blocks) if i not in to_remove]
 
 
+_FULL_WIDTH_FRACTION = 0.92  # an image at least this fraction of the page's own width is
+# almost certainly a decorative full-bleed background graphic (a paper-texture strip, a
+# gradient panel) -- real illustrations/photos in these textbooks are always inset with
+# visible margins, never edge-to-edge. Confirmed real bug: one page's background was split
+# into ~9 stacked full-width strips that, having no real text between them, chained
+# together with the chapter's title banner, its QR code, AND the page's real illustration
+# into one meaningless composite block -- which then got dropped outright as a "title
+# banner" (since the title dominated what the model saw), losing the real illustration
+# along with it. Dropped here structurally, before either merge pass ever sees them --
+# same free, no-API-call treatment as the tiny-icon and QR tiers, so they can never again
+# drag real content into a bad merge or cost a wasted judgment call apiece.
+
+
 def stage5_build_blocks(doc, start_page: int, end_page: int) -> list[dict]:
     all_blocks = []
     for page_idx in range(start_page - 1, end_page):
         page = doc[page_idx]
+        page_width = page.rect.width
         raw_text = list(page.get_text("blocks"))
         images = page.get_image_info(xrefs=True)
 
@@ -304,6 +318,8 @@ def stage5_build_blocks(doc, start_page: int, end_page: int) -> list[dict]:
                 combined.append((y0, x0, "text", [x0, y0, x1, y1], text, None))
         for img in images:
             bbox = img["bbox"]
+            if (bbox[2] - bbox[0]) >= page_width * _FULL_WIDTH_FRACTION:
+                continue  # decorative full-bleed background strip -- see _FULL_WIDTH_FRACTION
             combined.append((bbox[1], bbox[0], "image", bbox, None, img["xref"]))
         combined.sort(key=lambda item: (round(item[0] / 10), item[1]))
 
