@@ -101,7 +101,9 @@ Return ONLY a JSON array: [{{"block_id": ..., "type": ..., "keep": true/false, "
 
 IMAGE_JUDGE_PROMPT = (
     "This is one figure from a school textbook chapter, cropped from the page. "
-    "Nearby lesson text is given for context.\n\n"
+    "Nearby lesson text is given for context, along with the chapter's title and its "
+    "list of subtopics -- use the chapter-wide context (not just the nearby text) for "
+    "the relevance scoring and reproduction instructions described below.\n\n"
     "FIRST, check: is this primarily a TITLE OR SECTION-LABEL BANNER -- decorative "
     "artwork with heading-style text rendered inside the graphic itself, whether that's "
     "the CHAPTER'S OWN opening title (even if the artwork is thematically related to the "
@@ -160,6 +162,18 @@ IMAGE_JUDGE_PROMPT = (
     'choose "draw" -- it always works, "generate" is only better when confidently safe.\n'
     'Leave "reproduction" as an empty string "" for "drop" and "keep_image" -- it does not '
     "apply to either.\n\n"
+    "IF decision is NOT \"drop\", ALSO set \"relevance\" to how central this image actually "
+    "is to THIS CHAPTER specifically, using the chapter title and subtopic list given above "
+    "-- this applies to keep_image just as much as keep_description_only, since even a real, "
+    "kept photograph can be core to the lesson or just incidental supporting art:\n"
+    '- "core": directly illustrates a specific subtopic this chapter is actually teaching -- '
+    "removing it would lose something the chapter specifically needs.\n"
+    '- "supporting": genuinely related to the chapter\'s subject area, but not tied to one '
+    "specific subtopic being taught -- helpful context, not essential.\n"
+    '- "generic": could sit in almost any chapter on almost any topic (a generic classroom '
+    "scene, a stock icon, decorative filler) -- present, but not meaningfully tied to what "
+    "this specific chapter teaches.\n"
+    'Leave "relevance" as an empty string "" for "drop" -- it does not apply.\n\n'
     "IMPORTANT EXCEPTION -- check the nearby lesson text for this before applying the "
     "simplicity test above: if the activity asks the student to COUNT something shown in "
     "the image (e.g. 'how many circles do you see'), or to TRACE, COPY, or JOIN something "
@@ -196,17 +210,20 @@ IMAGE_JUDGE_PROMPT = (
     '- If "generate": write it as a fuller visual prompt suitable for an AI image generator '
     "-- color, style, and composition are fine here, since a generator can actually render "
     "them.\n"
-    "GROUND the instruction in the nearby lesson text when this image specifically "
-    "illustrates what's being taught right there (e.g. text about grandparents living with "
-    "grandchildren, next to an image of exactly that -- say so explicitly: 'a grandfather "
-    "with two grandchildren, illustrating a joint family caring for children together', not "
-    "just 'an old man with two children'). This keeps a redraw or regeneration on-topic "
-    "instead of drifting into something that merely resembles the original but no longer "
-    "serves the lesson. If the image is genuinely generic supporting art with no specific "
-    "tie to the surrounding content (could illustrate almost any lesson -- a stock 'child "
-    "writing in a notebook' scene, a generic 'people discussing' scene with nothing tying it "
-    "to this specific topic), do not invent a false connection to sound more relevant than it "
-    "is -- give the plain, honest instruction for what to draw/generate instead.\n\n"
+    "GROUND the instruction in the chapter context (title + subtopics) AND the nearby "
+    "lesson text when this image is \"core\" or \"supporting\" relevance -- don't just "
+    "describe the picture, NAME the specific subtopic or concept it connects to, using the "
+    "chapter's own subtopic wording where one applies (e.g. text about grandparents living "
+    "with grandchildren, next to an image of exactly that, under subtopic '1.2 Types of "
+    "families' -- say so explicitly: 'a grandfather with two grandchildren, illustrating "
+    "subtopic 1.2's point about joint families caring for children together', not just 'an "
+    "old man with two children'). This keeps a redraw or regeneration in sync with the "
+    "chapter instead of producing something that merely resembles the original but no "
+    "longer serves the lesson. If relevance is \"generic\" -- genuinely generic supporting "
+    "art with no specific tie to any subtopic (could illustrate almost any lesson -- a "
+    "stock 'child writing in a notebook' scene, a generic 'people discussing' scene), do "
+    "not invent a false connection to sound more relevant than it is -- give the plain, "
+    "honest instruction for what to draw/generate instead, with no fabricated topic tie.\n\n"
     'MATCH THE LENGTH OF "reason" TO THE IMAGE\'S ACTUAL COMPLEXITY, for both cases above -- '
     "do not pad every description out to the same length regardless of content, and do not "
     "compress a detailed image down to something that loses what's actually needed. A "
@@ -218,7 +235,7 @@ IMAGE_JUDGE_PROMPT = (
     "needed. If decision is \"drop\", reason can stay a brief one-line note on why it's "
     "decorative.\n\n"
     'Return ONLY {"decision": "drop"/"keep_description_only"/"keep_image", "reason": "...", '
-    '"reproduction": "generate"/"draw"/""}'
+    '"reproduction": "generate"/"draw"/"", "relevance": "core"/"supporting"/"generic"/""}'
 )
 
 TEXT_SCHEMA = {
@@ -241,8 +258,9 @@ IMAGE_SCHEMA = {
         "decision": {"type": "string", "enum": ["drop", "keep_description_only", "keep_image"]},
         "reason": {"type": "string"},
         "reproduction": {"type": "string", "enum": ["", "generate", "draw"]},
+        "relevance": {"type": "string", "enum": ["", "core", "supporting", "generic"]},
     },
-    "required": ["decision", "reason", "reproduction"],
+    "required": ["decision", "reason", "reproduction", "relevance"],
 }
 
 
@@ -366,10 +384,20 @@ def select_text_blocks(text_blocks: list[dict], api_key: str, chapter_number: in
     return {d["block_id"]: d for d in decisions}
 
 
-def judge_image(image_bytes: bytes, context_text: str, api_key: str) -> dict:
-    """One real visual judgment call, only for images not resolved by the free tiers."""
+def judge_image(image_bytes: bytes, context_text: str, api_key: str, chapter_context: str = "") -> dict:
+    """One real visual judgment call, only for images not resolved by the free tiers.
+
+    chapter_context: a compact, reusable summary (chapter title + its subtopic list --
+    see pipeline.py's _build_chapter_context) passed to every image judgment call in the
+    same chapter, so it can score how relevant an image actually is to what the chapter
+    teaches and name the right subtopic in a reproduction instruction, not just describe
+    the picture. Deliberately compact rather than the chapter's full text -- that would
+    repeat thousands of words across every image call in the chapter for no matching
+    benefit."""
     b64 = base64.b64encode(image_bytes).decode("ascii")
     text = IMAGE_JUDGE_PROMPT
+    if chapter_context.strip():
+        text += f"\n\nChapter context:\n{chapter_context.strip()}"
     if context_text.strip():
         text += f"\n\nNearby lesson text:\n{context_text.strip()}"
     payload = {
@@ -383,7 +411,7 @@ def judge_image(image_bytes: bytes, context_text: str, api_key: str) -> dict:
     return _call_with_retry(payload, api_key, timeout=60)
 
 
-def select_image_blocks(image_blocks: list[dict], crop_fn, context_fn, api_key: str, image_cache: list | None = None) -> dict:
+def select_image_blocks(image_blocks: list[dict], crop_fn, context_fn, api_key: str, image_cache: list | None = None, chapter_context: str = "") -> dict:
     """image_blocks: [{block_id, page, bbox}]. crop_fn(block) -> png bytes.
     context_fn(block) -> nearby text string. Returns {block_id: {keep, save_image, reason, tier}}.
 
@@ -453,16 +481,18 @@ def select_image_blocks(image_blocks: list[dict], crop_fn, context_fn, api_key: 
         if cached is not None:
             decisions[b["block_id"]] = {
                 "keep": cached["keep"], "save_image": cached["save_image"], "reason": cached["reason"],
-                "reproduction": cached.get("reproduction", ""), "tier": "llm_visual_cached", "_shared": cached,
+                "reproduction": cached.get("reproduction", ""), "relevance": cached.get("relevance", ""),
+                "tier": "llm_visual_cached", "_shared": cached,
             }
             continue
-        result = judge_image(crop, context_fn(b), api_key)
+        result = judge_image(crop, context_fn(b), api_key, chapter_context=chapter_context)
         decision = result.get("decision", "drop")
         judged = {
             "keep": decision in ("keep_image", "keep_description_only"),
             "save_image": decision == "keep_image",
             "reason": result.get("reason", ""),
             "reproduction": result.get("reproduction", ""),
+            "relevance": result.get("relevance", ""),
         }
         decisions[b["block_id"]] = {**judged, "tier": "llm_visual", "_shared": judged}
         if img_hash is not None:

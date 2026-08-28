@@ -365,6 +365,44 @@ def stage5_build_blocks(doc, start_page: int, end_page: int) -> list[dict]:
     return _merge_composite_images(_merge_fragmented_images(all_blocks))
 
 
+_SUBTOPIC_PATTERN = re.compile(r"^\d+\.\d+")
+
+
+def _build_chapter_context(ch: dict, text_blocks: list[dict], text_decisions: dict) -> str:
+    """A compact, reusable summary (chapter title + its subtopic list) given to every
+    image-judgment call IN THIS CHAPTER so it can score how relevant an image actually is
+    to what's being taught, and name the right concept in a reproduction instruction --
+    not just describe the picture. Deliberately NOT the chapter's full text: that would
+    repeat thousands of words across every image judgment call in the chapter, once per
+    image, for a cost with no matching benefit -- a title + a one-line subtopic list is
+    already enough signal for relevance scoring and topic-naming, at a small fraction of
+    the token cost of sending the whole chapter every time. No new API call -- reuses
+    data already produced by the existing text-classification pass.
+
+    A heading counts as a genuine subtopic here (not a recurring section label like "Do
+    These" or the chapter's own title) if its final text -- after select_text_blocks'
+    own topic_number correction, same as process_chapter applies below -- matches
+    "N.N": either topic_number was freshly assigned (missing/inconsistent numbering
+    corrected), or the heading's own extracted text already carried a clean number
+    (select_text_blocks leaves topic_number "" in exactly that case, since nothing
+    needed fixing) -- checking the text after prepending catches both without needing
+    a separate schema field for "is this a genuine subtopic"."""
+    subtopics = []
+    for b in text_blocks:
+        d = text_decisions.get(b["block_id"])
+        if not d or d.get("type") != "heading":
+            continue
+        text = b["text"]
+        if d.get("topic_number"):
+            text = f"{d['topic_number']}. {text}"
+        if _SUBTOPIC_PATTERN.match(text):
+            subtopics.append(text)
+    context = f"Chapter: {ch['title']}."
+    if subtopics:
+        context += " Covers: " + "; ".join(subtopics) + "."
+    return context
+
+
 def process_chapter(doc, ch: dict, book_id: str, images_dir: Path, api_key: str, image_cache: list | None = None) -> dict:
     blocks = stage5_build_blocks(doc, ch["start_page"], ch["end_page"])
     text_blocks = [b for b in blocks if b["type"] == "text"]
@@ -375,6 +413,7 @@ def process_chapter(doc, ch: dict, book_id: str, images_dir: Path, api_key: str,
 
     text_input = [{"block_id": b["block_id"], "page": b["page"], "bbox": b["bbox"], "text": b["text"]} for b in text_blocks]
     text_decisions = sel.select_text_blocks(text_input, api_key, chapter_number=ch["index"], chapter_title=ch["title"]) if text_input else {}
+    chapter_context = _build_chapter_context(ch, text_blocks, text_decisions)
 
     def crop_fn(b):
         page = doc[b["page"] - 1]
@@ -387,7 +426,7 @@ def process_chapter(doc, ch: dict, book_id: str, images_dir: Path, api_key: str,
         texts = [s["text"] for s in siblings[max(0, idx - 2):idx] + siblings[idx + 1:idx + 3] if s["type"] == "text"]
         return "\n".join(texts)
 
-    image_decisions = sel.select_image_blocks(image_blocks, crop_fn, context_fn, api_key, image_cache) if image_blocks else {}
+    image_decisions = sel.select_image_blocks(image_blocks, crop_fn, context_fn, api_key, image_cache, chapter_context=chapter_context) if image_blocks else {}
 
     kept = []
     seen_first_heading = False
@@ -449,6 +488,7 @@ def process_chapter(doc, ch: dict, book_id: str, images_dir: Path, api_key: str,
                 kept.append({
                     "block_id": b["block_id"], "page": b["page"], "content_type": "image", "bbox": b["bbox"],
                     "image_path": image_path, "description": d.get("reason", ""), "usage": "direct",
+                    "relevance": d.get("relevance") or "supporting",
                 })
             else:
                 shared = d.get("_shared")
@@ -476,6 +516,7 @@ def process_chapter(doc, ch: dict, book_id: str, images_dir: Path, api_key: str,
                     # reach this branch at all, whereas defaulting to "generate" risks an AI
                     # image generator garbling exact text/labels it was never confirmed to
                     # handle reliably.
+                    "relevance": d.get("relevance") or "supporting",
                 })
 
     kept.sort(key=lambda e: (e["page"], round(e["bbox"][1] / 10), e["bbox"][0]))

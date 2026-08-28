@@ -197,6 +197,7 @@ def adapt_chapter(canonical: dict) -> dict:
             images.append({
                 "path": item["image_path"], "caption": item.get("description", ""),
                 "page": item["page"], "usage": item.get("usage", "direct"),
+                "relevance": item.get("relevance", "supporting"),
             })
             lines.append(f"[FIGURE {fig_n}]")
         elif ctype == "image_description":
@@ -210,6 +211,7 @@ def adapt_chapter(canonical: dict) -> dict:
             images.append({
                 "path": None, "caption": item.get("description", ""),
                 "page": item["page"], "usage": item.get("usage", "draw"),
+                "relevance": item.get("relevance", "supporting"),
             })
             lines.append(f"[FIGURE {fig_n}]")
         elif ctype == "image_description_ref":
@@ -278,6 +280,7 @@ def publish_one_chapter(book_uuid: str, book_id: str, school_id: str, canonical:
             "school_id": school_id, "image_id": image_id, "caption": img["caption"],
             "storage_path": storage_path, "source_page": img["page"], "width": width,
             "height": height, "bytes": n_bytes, "order_index": i - 1, "usage": img["usage"],
+            "relevance": img["relevance"],
         })
 
     problems = validate_chapter(shaped, content, image_rows)
