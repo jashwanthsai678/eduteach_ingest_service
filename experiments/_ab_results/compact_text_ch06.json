@@ -1,0 +1,51 @@
+[
+ {
+  "chapter": 6,
+  "blocks": 209,
+  "baseline_a": {
+   "label": "baseline A",
+   "in": 17727,
+   "out": 9630,
+   "cost": 0.0293931,
+   "secs": 35.8
+  },
+  "baseline_b": {
+   "label": "baseline B",
+   "in": 17727,
+   "out": 9633,
+   "cost": 0.0294006,
+   "secs": 39.1
+  },
+  "compact": {
+   "label": "compact",
+   "in": 17757,
+   "out": 7186,
+   "cost": 0.0232921,
+   "secs": 30.7
+  },
+  "noise_rate": 9.569377990430622,
+  "variant_rate": 1.4354066985645932,
+  "verdict": "EQUIVALENT",
+  "reclassified_as_noise": [],
+  "diffs": [
+   {
+    "block_id": "p76_b02",
+    "baseline": "activity",
+    "compact": "concept",
+    "text": "You have seen the village map. Discuss the map in groups and"
+   },
+   {
+    "block_id": "p81_b10",
+    "baseline": "heading",
+    "compact": "summary",
+    "text": "What have we learnt?"
+   },
+   {
+    "block_id": "p83_b212",
+    "baseline": "heading",
+    "compact": "textbook_question",
+    "text": "I can do these"
+   }
+  ]
+ }
+]

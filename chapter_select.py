@@ -47,30 +47,50 @@ _COLOR_MAX_MEAN_DIFF = 20  # out of 255 per B/G/R channel -- validated against r
 MODEL = "google/gemini-2.5-flash"
 _API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
+# Single-letter category codes on the wire, decoded back to the full names here.
+# A/B-verified against the previous spelled-out format on two real chapters
+# (see experiments/ab_compact_text.py and experiments/_ab_results/): the model
+# is 9.6-10.1% inconsistent with ITSELF between two identical runs, while this
+# format disagrees with the old one on only 1.4-1.9% of blocks -- five times
+# inside the model's own noise floor, with zero blocks downgraded to noise in
+# either chapter. It cut output tokens ~24% and the text call's cost ~20%.
+#
+# A letter added here must also be added to TEXT_SCHEMA's enum below AND
+# described in the prompt, or the model can never emit it.
+_TYPE_DECODE = {
+    "c": "concept",
+    "a": "activity",
+    "n": "noise",
+    "h": "heading",
+    "k": "key_words",
+    "s": "summary",
+    "q": "textbook_question",
+}
+
 TEXT_SELECT_PROMPT_TEMPLATE = """You are looking at the TEXT blocks of chapter {chapter_number} of one textbook, page by page, in the order they actually appear. Each has a block_id, page, bbox, and its actual extracted text. This chapter's own known title is: "{chapter_title}".
 
-Classify each block:
-- "concept": explains/teaches an idea
-- "activity": a task/question/exercise the student does, as part of the lesson itself
-- "noise": running headers/footers, page numbers, decorative bars, front matter -- not real content
-- "heading": a section/topic heading
-- "key_words": the recurring end-of-chapter glossary/key-terms list (often labelled "Key
+Classify each block with a SINGLE LETTER:
+- "c" concept: explains/teaches an idea
+- "a" activity: a task/question/exercise the student does, as part of the lesson itself
+- "n" noise: running headers/footers, page numbers, decorative bars, front matter -- not real content
+- "h" heading: a section/topic heading
+- "k" key_words: the recurring end-of-chapter glossary/key-terms list (often labelled "Key
   words" or similar) -- a short list of this chapter's important terms.
-- "summary": the recurring end-of-chapter bullet-point recap (often labelled "What have we
+- "s" summary: the recurring end-of-chapter bullet-point recap (often labelled "What have we
   learnt?" or similar) -- short statements restating the chapter's main points.
-- "textbook_question": part of the chapter's FORMAL, clearly-delineated closing assessment
-  section -- typically comes after key_words/summary, often organized under this series'
-  standard competency headings repeated every chapter ("Conceptual Understanding",
+- "q" textbook_question: part of the chapter's FORMAL, clearly-delineated closing assessment
+  section -- typically comes after the key-words/summary sections, often organized under this
+  series' standard competency headings repeated every chapter ("Conceptual Understanding",
   "Questioning - Hypotheses", "Experiments - Field Observations", "Information Skills,
   Projects", "Communication through Mapping Skills, Drawing Pictures and Making Models",
   "Appreciation, Values and Awareness"), or simply a block under an explicit "Exercise"/
   "Questions" recurring section label. Use this ONLY for that formal, position-clear closing
   block -- an ordinary in-lesson activity/question earlier in the chapter (e.g. "Discuss in
-  groups", "Think and Discuss", a question embedded mid-lesson) stays "activity" even though
-  it's also phrased as a question. The signal is being part of the chapter's clearly-marked
+  groups", "Think and Discuss", a question embedded mid-lesson) stays "a" even though it is
+  also phrased as a question. The signal is being part of the chapter's clearly-marked
   closing assessment, not just "is this a question."
 
-ADDITIONALLY, for every block classified "heading": decide whether it is a GENUINE SUBTOPIC
+ADDITIONALLY, for every block classified "h": decide whether it is a GENUINE SUBTOPIC
 heading -- a real, distinct section of the chapter's subject matter (e.g. "Rectangle", "Square",
 "2.1 Rules of the Games") -- as opposed to:
 - a RECURRING SECTION LABEL that appears multiple times across the chapter as a generic
@@ -82,21 +102,22 @@ heading -- a real, distinct section of the chapter's subject matter (e.g. "Recta
   together spell the one title "CHANGING FAMILY STRUCTURE"). Any block that is this title, or
   part of it, is the chapter's own name, not a subtopic of it.
 Neither recurring section labels nor the chapter's own title/title-fragments are subtopics --
-they never get a topic_number, and they must NOT be counted when determining subtopic sequence.
+they never get a topic number, and they must NOT be counted when determining subtopic sequence.
 
 For each GENUINE SUBTOPIC heading, check whether the chapter's subtopic headings, in the order
 they actually appear, already carry clean, correctly SEQUENTIAL numbers (e.g. {chapter_number}.1,
 then {chapter_number}.2, then {chapter_number}.3 -- no gaps, no repeats, no out-of-order jumps).
-If they already do, set "topic_number" to an empty string "" -- it's already correct, leave it
-alone. If numbering is missing entirely, inconsistent, or out of order, set "topic_number" to the
-CORRECT sequential number this heading should have, formatted as "{chapter_number}.N" (e.g.
-"{chapter_number}.1", "{chapter_number}.2"), counting only genuine subtopics in the order they
-actually appear in the chapter -- not the order any existing broken numbers might suggest.
+If they already do, set "n" to an empty string "" -- it is already correct, leave it alone. If
+numbering is missing entirely, inconsistent, or out of order, set "n" to the CORRECT sequential
+number this heading should have, formatted as "{chapter_number}.N" (e.g. "{chapter_number}.1",
+"{chapter_number}.2"), counting only genuine subtopics in the order they actually appear in the
+chapter -- not the order any existing broken numbers might suggest.
 
 For every block that is not a genuine subtopic heading (including recurring section labels, the
-chapter's own title, and every non-heading block), "topic_number" is always "".
+chapter's own title, and every non-heading block), "n" is always "".
 
-Return ONLY a JSON array: [{{"block_id": ..., "type": ..., "keep": true/false, "topic_number": ...}}], one per block_id given.
+Return ONLY a JSON array, one object per block_id given, where "b" is the block_id, "t" is the
+single-letter type, and "n" is the topic number: [{{"b": ..., "t": ..., "n": ...}}]
 """
 
 IMAGE_JUDGE_PROMPT = (
@@ -263,12 +284,25 @@ TEXT_SCHEMA = {
     "items": {
         "type": "object",
         "properties": {
-            "block_id": {"type": "string"},
-            "type": {"type": "string", "enum": ["concept", "activity", "noise", "heading", "key_words", "summary", "textbook_question"]},
-            "keep": {"type": "boolean"},
-            "topic_number": {"type": "string"},
+            # b = block_id, t = single-letter type, n = topic_number. Short keys
+            # because these three names are repeated once per block in the
+            # answer, and the answer is where the cost is: measured on a real
+            # 208-block chapter, output was 81% of that call's bill.
+            #
+            # block_id deliberately STAYS on the wire rather than relying on
+            # positional alignment -- it is what makes the full-coverage check
+            # in select_text_blocks possible at all, and silent misalignment on
+            # a 200-item array is exactly the failure that check exists for.
+            #
+            # There is no "keep" field: noise is the only category the pipeline
+            # ever drops, so keep is always (type != "noise") and asking the
+            # model to restate it per block only costs output tokens. The A/B
+            # confirmed the derivation never disagreed with an explicit keep.
+            "b": {"type": "string"},
+            "t": {"type": "string", "enum": ["a", "c", "h", "k", "n", "q", "s"]},
+            "n": {"type": "string"},
         },
-        "required": ["block_id", "type", "keep", "topic_number"],
+        "required": ["b", "t", "n"],
     },
 }
 
@@ -359,19 +393,37 @@ def _bbox_area(bbox: list) -> float:
     return max(0, bbox[2] - bbox[0]) * max(0, bbox[3] - bbox[1])
 
 
-def _call_with_retry(payload: dict, api_key: str, timeout: int, max_attempts: int = 3):
+class IncompleteSelection(RuntimeError):
+    """The model returned well-formed JSON that silently omits blocks it was asked
+    to classify. Its own class so a partial answer is distinguishable from a
+    transport/parse failure both in the retry loop and in a caller's logs."""
+
+
+def _call_with_retry(payload: dict, api_key: str, timeout: int, max_attempts: int = 3, validate=None):
     """Two real chapters (out of 16, in a live run) failed with JSONDecodeError --
     the model occasionally returns truncated/malformed JSON even under a schema
     constraint. No retry existed before; this is the fix, same backoff pattern
     Phase 1 already uses for its own model calls (extract_v2.py predict_page,
-    image_triage.py categorize_image)."""
+    image_triage.py categorize_image).
+
+    validate(parsed), if given, is called on the decoded response and must raise to
+    reject it; a rejected response is retried exactly like a transport or parse
+    failure. Needed because that same truncation has a quieter second form than
+    JSONDecodeError: a response that parses perfectly but only covers SOME of the
+    blocks it was given. `response_format: json_schema` constrains each item's
+    SHAPE, never the array's COMPLETENESS, so nothing else in this path catches
+    it -- see select_text_blocks' own validator for why that silently lost real
+    textbook text."""
     last_exc = RuntimeError("failed on every attempt")
     for attempt in range(1, max_attempts + 1):
         try:
             resp = requests.post(_API_URL, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, json=payload, timeout=timeout)
             resp.raise_for_status()
             raw = resp.json()["choices"][0]["message"]["content"]
-            return json.loads(raw)
+            parsed = json.loads(raw)
+            if validate is not None:
+                validate(parsed)
+            return parsed
         except Exception as exc:
             last_exc = exc
             print(f"    attempt {attempt}/{max_attempts} failed: {exc!r}")
@@ -400,8 +452,46 @@ def select_text_blocks(text_blocks: list[dict], api_key: str, chapter_number: in
         "messages": [{"role": "user", "content": prompt + "\n\n" + json.dumps(text_blocks, ensure_ascii=False)}],
         "response_format": {"type": "json_schema", "json_schema": {"name": "selection", "schema": TEXT_SCHEMA}},
     }
-    decisions = _call_with_retry(payload, api_key, timeout=120)
-    return {d["block_id"]: d for d in decisions}
+    expected = {b["block_id"] for b in text_blocks}
+
+    def _require_full_coverage(parsed):
+        """Every block sent must come back with a decision. Without this check, a
+        block the model simply OMITTED was indistinguishable from one it decided to
+        drop: pipeline.py's `d = text_decisions.get(block_id); if not d or not
+        d.get("keep"): continue` treats a missing entry exactly like keep=False, so
+        an incomplete response silently deleted real textbook text from the
+        published chapter with no error, no warning, and nothing in the stats to
+        show it (`stats.kept` only ever counted what survived). That is the exact
+        failure this pipeline exists to avoid -- the whole reason Phase 2 does the
+        cutting in Python is so served text is traceable to the real page.
+
+        Deliberately RAISES rather than defaulting the missing blocks to keep=True:
+        a chapter that fails loudly is skipped by process_book_streaming's per-
+        chapter try/except (reported as "chapter_failed", the rest of the book
+        continues) and is picked up by publish.py's resume logic on the next run,
+        whereas a silently patched-up chapter would be published with `published=
+        true` and served to schools with nobody aware it is wrong."""
+        returned = {d["b"] for d in parsed if isinstance(d, dict) and "b" in d}
+        missing = expected - returned
+        if missing:
+            raise IncompleteSelection(
+                f"model classified {len(returned)}/{len(expected)} text blocks; "
+                f"{len(missing)} missing (e.g. {sorted(missing)[:5]})"
+            )
+
+    decisions = _call_with_retry(payload, api_key, timeout=120, validate=_require_full_coverage)
+    out = {}
+    for d in decisions:
+        # An unrecognised letter becomes noise rather than raising: a single
+        # malformed item should not cost the chapter, and the enum makes this
+        # near-impossible in the first place.
+        content_type = _TYPE_DECODE.get(d["t"], "noise")
+        out[d["b"]] = {
+            "type": content_type,
+            "keep": content_type != "noise",
+            "topic_number": d.get("n", ""),
+        }
+    return out
 
 
 def judge_image(image_bytes: bytes, context_text: str, api_key: str, chapter_context: str = "") -> dict:
@@ -478,7 +568,21 @@ def select_image_blocks(image_blocks: list[dict], crop_fn, context_fn, api_key: 
         if area <= _TINY_IMAGE_MAX_AREA:
             decisions[b["block_id"]] = {"keep": False, "save_image": False, "reason": "tiny icon (<1600px^2), free tier", "tier": "tiny"}
             continue
-        crop = crop_fn(b)
+        try:
+            crop = crop_fn(b)
+        except Exception as exc:
+            # A crop that cannot be rasterised must never cost the whole chapter. The one
+            # known cause -- image placements outside the page rect -- is fixed at source
+            # in pipeline.py's stage5_build_blocks, so anything reaching here is a PDF
+            # shape this pipeline has not seen before or a genuinely corrupt image object.
+            # In either case dropping the single image is right, and losing the other ~15
+            # pages of the chapter is not -- which is exactly what an uncaught raise here
+            # used to do.
+            decisions[b["block_id"]] = {
+                "keep": False, "save_image": False,
+                "reason": f"crop failed ({exc!r}), free tier", "tier": "crop_failed",
+            }
+            continue
         # merged_from means this crop is the union of several original blocks (fragment or
         # composite merge) -- _is_qr_code's cv2 detector fires on ANY QR pattern found
         # anywhere in the crop, not just a crop that's PURELY a QR code, so a merged block

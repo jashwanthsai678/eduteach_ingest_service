@@ -344,7 +344,23 @@ def stage5_build_blocks(doc, start_page: int, end_page: int) -> list[dict]:
             if btype == 0 and text:
                 combined.append((y0, x0, "text", [x0, y0, x1, y1], text, None))
         for img in images:
-            bbox = img["bbox"]
+            # get_image_info can report a placement lying partly or wholly OUTSIDE the
+            # visible page -- confirmed on real data (Class 4 EVS p59: bbox x running from
+            # -1062 to -924; p61: y at 2258 on an 842pt page). Both merge passes below
+            # happily union those coordinates, and mupdf then refuses to rasterise the
+            # result ("FzErrorArgument: Invalid bandwriter header dimensions/setup"), which
+            # raised straight out of select_image_blocks' crop and aborted the WHOLE
+            # chapter -- 2 of that book's 12 chapters published nothing at all because of
+            # it. Clipping here fixes the cause rather than the symptom: a placement
+            # entirely off the page was never visible content and is dropped, while a
+            # partly off-page one keeps the part a reader can actually see and goes on
+            # through the normal tiers. Clipping BEFORE the full-width test also makes
+            # that test more honest -- it now measures visible width, not a width
+            # inflated by however far the placement overhangs the paper.
+            rect = pymupdf.Rect(*img["bbox"]) & page.rect
+            if rect.is_empty:
+                continue
+            bbox = [rect.x0, rect.y0, rect.x1, rect.y1]
             if (bbox[2] - bbox[0]) >= page_width * _FULL_WIDTH_FRACTION:
                 continue  # decorative full-bleed background strip -- see _FULL_WIDTH_FRACTION
             combined.append((bbox[1], bbox[0], "image", bbox, None, img["xref"]))
