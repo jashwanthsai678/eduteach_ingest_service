@@ -306,6 +306,35 @@ TEXT_SCHEMA = {
     },
 }
 
+BATCH_PREAMBLE = (
+    "You are judging SEVERAL figures from one school textbook chapter in this single "
+    "request. Each figure is introduced by a line reading `### FIGURE <id>` followed by "
+    "that figure's own nearby lesson text, and then the figure image itself.\n\n"
+    "Judge every figure INDEPENDENTLY and on its own merits, exactly as if it were the "
+    "only one in front of you. Do not let one figure's decision influence another's, and "
+    "do not try to make the decisions look varied or consistent as a set -- several "
+    "figures in one chapter genuinely can all be drops, or all be keeps.\n\n"
+    "Return one object per figure, and put that figure's `### FIGURE <id>` id in the "
+    '"b" field so each judgment can be matched back to its figure. Return an object for '
+    "EVERY figure given, in the same order they appear.\n\n"
+    "The rules for judging each figure follow.\n\n"
+)
+
+BATCH_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "b": {"type": "string"},
+            "decision": {"type": "string", "enum": ["drop", "keep_description_only", "keep_image"]},
+            "reason": {"type": "string"},
+            "reproduction": {"type": "string", "enum": ["", "generate", "draw"]},
+            "relevance": {"type": "string", "enum": ["", "core", "supporting", "generic"]},
+        },
+        "required": ["b", "decision", "reason", "reproduction", "relevance"],
+    },
+}
+
 IMAGE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -521,43 +550,113 @@ def judge_image(image_bytes: bytes, context_text: str, api_key: str, chapter_con
     return _call_with_retry(payload, api_key, timeout=60)
 
 
+_MAX_BATCH_IMAGES = 5          # hard cap per request
+_MAX_BATCH_BYTES = 2_000_000   # ~2MB of base64 per request -- the real constraint
+
+# Several figures are judged per request rather than one, because the judge
+# prompt above is ~3,079 tokens and was ~74% of an average single-image
+# request's input, re-sent for every figure in the book. A/B-verified on two
+# real chapters against the per-image path run twice (see
+# experiments/ab_batched_images.py and experiments/_ab_results/):
+#
+#            self-variance   batched   requests   image-stage cost
+#   ch5           3.6%         3.6%     27 -> 11       -45.1%
+#   ch6           0.0%         0.0%     15 ->  5       -42.8%
+#
+# Zero images the per-image path kept were dropped by the batch, in either
+# chapter. Batching does cost a little: figures inside one batch cannot reuse
+# each other's cache entries, so slightly MORE figures get judged (ch5 27->28,
+# ch6 15->18) and output tokens rise -- both measured, both far outweighed.
+#
+# The batch size is bounded by REQUEST SIZE before anything else. Measured
+# base64 crop sizes on real chapters: median 261KB, p90 1,256KB, max 3,042KB --
+# skewed enough that a naive "5 at a time" can post 8.6MB, and this service has
+# already hit Render's 512MB ceiling twice. Hence a byte budget, with the count
+# only as a backstop.
+
+
+def _plan_batches(items):
+    """items: [(block, crop_bytes)]. Yields lists, byte-budgeted then count-capped.
+
+    A crop bigger than the whole budget is emitted alone rather than skipped --
+    it still has to be judged, it just cannot share a request with anything."""
+    batch, total = [], 0
+    for block, crop in items:
+        size = len(crop) * 4 // 3  # base64 expansion
+        if batch and (total + size > _MAX_BATCH_BYTES or len(batch) >= _MAX_BATCH_IMAGES):
+            yield batch
+            batch, total = [], 0
+        batch.append((block, crop))
+        total += size
+    if batch:
+        yield batch
+
+
+def judge_batch(items, context_fn, api_key, chapter_context=""):
+    """One request covering several figures. Returns {block_id: raw judgment}."""
+    content = [{"type": "text", "text": BATCH_PREAMBLE + IMAGE_JUDGE_PROMPT
+                + (f"\n\nChapter context:\n{chapter_context.strip()}" if chapter_context.strip() else "")}]
+    for block, crop in items:
+        nearby = context_fn(block).strip()
+        head = f"\n\n### FIGURE {block['block_id']}\n"
+        if nearby:
+            head += f"Nearby lesson text:\n{nearby}\n"
+        content.append({"type": "text", "text": head})
+        content.append({"type": "image_url", "image_url": {
+            "url": "data:image/png;base64," + base64.b64encode(crop).decode("ascii")}})
+
+    payload = {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": content}],
+        "response_format": {"type": "json_schema", "json_schema": {"name": "judgments", "schema": BATCH_SCHEMA}},
+    }
+    expected = {b["block_id"] for b, _ in items}
+
+    def _require_full_coverage(parsed):
+        """Keyed on the figure id, never on position -- with several figures in
+        one request, a silently reordered or short answer would otherwise attach
+        one figure's judgment to a different figure's crop."""
+        returned = {d["b"] for d in parsed if isinstance(d, dict) and "b" in d}
+        missing = expected - returned
+        if missing:
+            raise IncompleteSelection(
+                f"batch judged {len(returned)}/{len(expected)} figures; missing {sorted(missing)}")
+
+    results = _call_with_retry(payload, api_key, timeout=180, validate=_require_full_coverage)
+    return {d["b"]: d for d in results}
+
+
 def select_image_blocks(image_blocks: list[dict], crop_fn, context_fn, api_key: str, image_cache: list | None = None, chapter_context: str = "") -> dict:
     """image_blocks: [{block_id, page, bbox}]. crop_fn(block) -> png bytes.
     context_fn(block) -> nearby text string. Returns {block_id: {keep, save_image, reason, tier}}.
 
-    save_image distinguishes two kinds of "keep": True means the actual
-    cropped image must be saved/uploaded (a photo, map, or a diagram whose
-    precise visual detail matters); False means the content is genuine but
-    simple/generic enough that "reason" alone (a teacher-redrawable /
-    AI-regeneratable description) is sufficient, so no file is ever cropped,
-    saved, or uploaded for it downstream -- real storage/upload savings for
-    the images that don't need to be pixel-faithful.
+    save_image distinguishes two kinds of "keep": True means the actual cropped
+    image must be saved/uploaded (a photo, map, or a diagram whose precise visual
+    detail matters); False means the content is genuine but simple/generic enough
+    that "reason" alone (a teacher-redrawable / AI-regeneratable description) is
+    sufficient, so no file is ever cropped, saved, or uploaded for it downstream.
 
-    image_cache: optional list of (perceptual_hash, judgment_result) pairs,
-    shared and mutated across calls (e.g. across every chapter in a book) so
-    a recurring image (banner, footer icon) is only ever sent to Gemini
-    once -- every later occurrence, even with minor pixel differences (a
-    different page number baked into the same banner, slight compression
-    variation), reuses the cached decision via a tolerant Hamming-distance
-    match instead of paying for another vision call. A plain dict keyed by
-    exact hash was tried first and would only catch byte-identical crops --
-    real recurring images almost never hash bit-for-bit identical, so this
-    is a list scanned with _find_cached's tolerance instead. Pass the SAME
-    list into every call for a book to get the cross-chapter benefit; omit
-    it to fall back to no caching.
+    Four free deterministic tiers run before anything is sent to a model: tiny
+    icons by area, crops that cannot be rasterised, standalone QR codes, and a
+    perceptual-hash cache of judgments already made. Only survivors are judged,
+    and they are judged several per request (see _plan_batches above).
 
-    Each returned decision also carries "_shared": for llm_visual/
-    llm_visual_cached tiers, this is the SAME dict object stored inside
-    image_cache for that hash -- every occurrence of one recurring image
-    points at one shared object. The caller (pipeline.py) uses this to
-    record the saved file's path after the FIRST occurrence crops and
-    saves it, so every later occurrence of the same image reuses that
-    exact file instead of cropping and saving a fresh (nearly-identical,
-    but not byte-identical) copy of the same picture again. Without this,
-    the judgment cache alone still avoids the Gemini cost per recurrence,
-    but not the crop/save/upload cost -- confirmed on real data: a
-    recurring illustration that appeared 4 times produced 4 separate
-    ~35KB files, all the same picture."""
+    Each returned decision carries "_shared": for the llm_batched/
+    llm_visual_cached tiers this is the SAME dict object stored inside
+    image_cache for that hash, so every occurrence of one recurring image points
+    at one shared object. pipeline.py uses this to record the saved file's path
+    after the FIRST occurrence crops and saves it, so later occurrences reuse
+    that exact file instead of saving a near-identical copy -- confirmed on real
+    data, a recurring illustration appearing 4 times produced 4 separate ~35KB
+    files of the same picture without it.
+
+    image_cache: optional list of (perceptual_hash, color_signature, judgment)
+    triples, shared and mutated across every chapter in a book, so a recurring
+    banner or footer icon is only ever judged once. Matched with Hamming
+    tolerance rather than exact equality -- real recurring images almost never
+    hash bit-for-bit identical, since a different page number is baked into each
+    occurrence. Pass the SAME list into every call for a book to get the
+    cross-chapter benefit; omit it to fall back to no caching."""
     if image_cache is None:
         image_cache = []
 
@@ -598,6 +697,10 @@ def select_image_blocks(image_blocks: list[dict], crop_fn, context_fn, api_key: 
         else:
             to_judge.append((b, crop))
 
+    # The cache is consulted per figure BEFORE batching, so everything already
+    # judged earlier in the book still hits for free; only reuse BETWEEN figures
+    # inside one batch is lost, which the A/B measured and accepted.
+    pending = []
     for b, crop in to_judge:
         img_hash = _perceptual_hash(crop)
         color_sig = _color_signature(crop)
@@ -609,17 +712,42 @@ def select_image_blocks(image_blocks: list[dict], crop_fn, context_fn, api_key: 
                 "tier": "llm_visual_cached", "_shared": cached,
             }
             continue
-        result = judge_image(crop, context_fn(b), api_key, chapter_context=chapter_context)
-        decision = result.get("decision", "drop")
-        judged = {
-            "keep": decision in ("keep_image", "keep_description_only"),
-            "save_image": decision == "keep_image",
-            "reason": result.get("reason", ""),
-            "reproduction": result.get("reproduction", ""),
-            "relevance": result.get("relevance", ""),
-        }
-        decisions[b["block_id"]] = {**judged, "tier": "llm_visual", "_shared": judged}
-        if img_hash is not None:
-            image_cache.append((img_hash, color_sig, judged))
+        pending.append((b, crop, img_hash, color_sig))
+
+    for batch in _plan_batches([(b, crop) for b, crop, _, _ in pending]):
+        ids = {b["block_id"] for b, _ in batch}
+        try:
+            judged_raw = judge_batch(batch, context_fn, api_key, chapter_context)
+        except Exception as exc:
+            # A batch that cannot be salvaged degrades to one request per figure
+            # rather than losing every figure in the group. This is the whole
+            # reason judge_image() is kept alongside judge_batch().
+            print(f"    batch of {len(batch)} failed ({exc!r}); falling back to per-image calls")
+            judged_raw = {}
+            for b, crop in batch:
+                try:
+                    judged_raw[b["block_id"]] = judge_image(crop, context_fn(b), api_key, chapter_context)
+                except Exception as inner:
+                    print(f"      {b['block_id']} also failed on its own: {inner!r}")
+
+        for b, crop, img_hash, color_sig in pending:
+            if b["block_id"] not in ids:
+                continue
+            result = judged_raw.get(b["block_id"])
+            if result is None:
+                decisions[b["block_id"]] = {"keep": False, "save_image": False,
+                                            "reason": "no judgment returned", "tier": "batch_missing"}
+                continue
+            decision = result.get("decision", "drop")
+            judged = {
+                "keep": decision in ("keep_image", "keep_description_only"),
+                "save_image": decision == "keep_image",
+                "reason": result.get("reason", ""),
+                "reproduction": result.get("reproduction", ""),
+                "relevance": result.get("relevance", ""),
+            }
+            decisions[b["block_id"]] = {**judged, "tier": "llm_batched", "_shared": judged}
+            if img_hash is not None:
+                image_cache.append((img_hash, color_sig, judged))
 
     return decisions
