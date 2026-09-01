@@ -359,19 +359,37 @@ def _bbox_area(bbox: list) -> float:
     return max(0, bbox[2] - bbox[0]) * max(0, bbox[3] - bbox[1])
 
 
-def _call_with_retry(payload: dict, api_key: str, timeout: int, max_attempts: int = 3):
+class IncompleteSelection(RuntimeError):
+    """The model returned well-formed JSON that silently omits blocks it was asked
+    to classify. Its own class so a partial answer is distinguishable from a
+    transport/parse failure both in the retry loop and in a caller's logs."""
+
+
+def _call_with_retry(payload: dict, api_key: str, timeout: int, max_attempts: int = 3, validate=None):
     """Two real chapters (out of 16, in a live run) failed with JSONDecodeError --
     the model occasionally returns truncated/malformed JSON even under a schema
     constraint. No retry existed before; this is the fix, same backoff pattern
     Phase 1 already uses for its own model calls (extract_v2.py predict_page,
-    image_triage.py categorize_image)."""
+    image_triage.py categorize_image).
+
+    validate(parsed), if given, is called on the decoded response and must raise to
+    reject it; a rejected response is retried exactly like a transport or parse
+    failure. Needed because that same truncation has a quieter second form than
+    JSONDecodeError: a response that parses perfectly but only covers SOME of the
+    blocks it was given. `response_format: json_schema` constrains each item's
+    SHAPE, never the array's COMPLETENESS, so nothing else in this path catches
+    it -- see select_text_blocks' own validator for why that silently lost real
+    textbook text."""
     last_exc = RuntimeError("failed on every attempt")
     for attempt in range(1, max_attempts + 1):
         try:
             resp = requests.post(_API_URL, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, json=payload, timeout=timeout)
             resp.raise_for_status()
             raw = resp.json()["choices"][0]["message"]["content"]
-            return json.loads(raw)
+            parsed = json.loads(raw)
+            if validate is not None:
+                validate(parsed)
+            return parsed
         except Exception as exc:
             last_exc = exc
             print(f"    attempt {attempt}/{max_attempts} failed: {exc!r}")
@@ -400,7 +418,34 @@ def select_text_blocks(text_blocks: list[dict], api_key: str, chapter_number: in
         "messages": [{"role": "user", "content": prompt + "\n\n" + json.dumps(text_blocks, ensure_ascii=False)}],
         "response_format": {"type": "json_schema", "json_schema": {"name": "selection", "schema": TEXT_SCHEMA}},
     }
-    decisions = _call_with_retry(payload, api_key, timeout=120)
+    expected = {b["block_id"] for b in text_blocks}
+
+    def _require_full_coverage(parsed):
+        """Every block sent must come back with a decision. Without this check, a
+        block the model simply OMITTED was indistinguishable from one it decided to
+        drop: pipeline.py's `d = text_decisions.get(block_id); if not d or not
+        d.get("keep"): continue` treats a missing entry exactly like keep=False, so
+        an incomplete response silently deleted real textbook text from the
+        published chapter with no error, no warning, and nothing in the stats to
+        show it (`stats.kept` only ever counted what survived). That is the exact
+        failure this pipeline exists to avoid -- the whole reason Phase 2 does the
+        cutting in Python is so served text is traceable to the real page.
+
+        Deliberately RAISES rather than defaulting the missing blocks to keep=True:
+        a chapter that fails loudly is skipped by process_book_streaming's per-
+        chapter try/except (reported as "chapter_failed", the rest of the book
+        continues) and is picked up by publish.py's resume logic on the next run,
+        whereas a silently patched-up chapter would be published with `published=
+        true` and served to schools with nobody aware it is wrong."""
+        returned = {d["block_id"] for d in parsed if isinstance(d, dict) and "block_id" in d}
+        missing = expected - returned
+        if missing:
+            raise IncompleteSelection(
+                f"model classified {len(returned)}/{len(expected)} text blocks; "
+                f"{len(missing)} missing (e.g. {sorted(missing)[:5]})"
+            )
+
+    decisions = _call_with_retry(payload, api_key, timeout=120, validate=_require_full_coverage)
     return {d["block_id"]: d for d in decisions}
 
 
@@ -478,7 +523,21 @@ def select_image_blocks(image_blocks: list[dict], crop_fn, context_fn, api_key: 
         if area <= _TINY_IMAGE_MAX_AREA:
             decisions[b["block_id"]] = {"keep": False, "save_image": False, "reason": "tiny icon (<1600px^2), free tier", "tier": "tiny"}
             continue
-        crop = crop_fn(b)
+        try:
+            crop = crop_fn(b)
+        except Exception as exc:
+            # A crop that cannot be rasterised must never cost the whole chapter. The one
+            # known cause -- image placements outside the page rect -- is fixed at source
+            # in pipeline.py's stage5_build_blocks, so anything reaching here is a PDF
+            # shape this pipeline has not seen before or a genuinely corrupt image object.
+            # In either case dropping the single image is right, and losing the other ~15
+            # pages of the chapter is not -- which is exactly what an uncaught raise here
+            # used to do.
+            decisions[b["block_id"]] = {
+                "keep": False, "save_image": False,
+                "reason": f"crop failed ({exc!r}), free tier", "tier": "crop_failed",
+            }
+            continue
         # merged_from means this crop is the union of several original blocks (fragment or
         # composite merge) -- _is_qr_code's cv2 detector fires on ANY QR pattern found
         # anywhere in the crop, not just a crop that's PURELY a QR code, so a merged block
