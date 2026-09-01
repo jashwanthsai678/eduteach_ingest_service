@@ -47,30 +47,50 @@ _COLOR_MAX_MEAN_DIFF = 20  # out of 255 per B/G/R channel -- validated against r
 MODEL = "google/gemini-2.5-flash"
 _API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
+# Single-letter category codes on the wire, decoded back to the full names here.
+# A/B-verified against the previous spelled-out format on two real chapters
+# (see experiments/ab_compact_text.py and experiments/_ab_results/): the model
+# is 9.6-10.1% inconsistent with ITSELF between two identical runs, while this
+# format disagrees with the old one on only 1.4-1.9% of blocks -- five times
+# inside the model's own noise floor, with zero blocks downgraded to noise in
+# either chapter. It cut output tokens ~24% and the text call's cost ~20%.
+#
+# A letter added here must also be added to TEXT_SCHEMA's enum below AND
+# described in the prompt, or the model can never emit it.
+_TYPE_DECODE = {
+    "c": "concept",
+    "a": "activity",
+    "n": "noise",
+    "h": "heading",
+    "k": "key_words",
+    "s": "summary",
+    "q": "textbook_question",
+}
+
 TEXT_SELECT_PROMPT_TEMPLATE = """You are looking at the TEXT blocks of chapter {chapter_number} of one textbook, page by page, in the order they actually appear. Each has a block_id, page, bbox, and its actual extracted text. This chapter's own known title is: "{chapter_title}".
 
-Classify each block:
-- "concept": explains/teaches an idea
-- "activity": a task/question/exercise the student does, as part of the lesson itself
-- "noise": running headers/footers, page numbers, decorative bars, front matter -- not real content
-- "heading": a section/topic heading
-- "key_words": the recurring end-of-chapter glossary/key-terms list (often labelled "Key
+Classify each block with a SINGLE LETTER:
+- "c" concept: explains/teaches an idea
+- "a" activity: a task/question/exercise the student does, as part of the lesson itself
+- "n" noise: running headers/footers, page numbers, decorative bars, front matter -- not real content
+- "h" heading: a section/topic heading
+- "k" key_words: the recurring end-of-chapter glossary/key-terms list (often labelled "Key
   words" or similar) -- a short list of this chapter's important terms.
-- "summary": the recurring end-of-chapter bullet-point recap (often labelled "What have we
+- "s" summary: the recurring end-of-chapter bullet-point recap (often labelled "What have we
   learnt?" or similar) -- short statements restating the chapter's main points.
-- "textbook_question": part of the chapter's FORMAL, clearly-delineated closing assessment
-  section -- typically comes after key_words/summary, often organized under this series'
-  standard competency headings repeated every chapter ("Conceptual Understanding",
+- "q" textbook_question: part of the chapter's FORMAL, clearly-delineated closing assessment
+  section -- typically comes after the key-words/summary sections, often organized under this
+  series' standard competency headings repeated every chapter ("Conceptual Understanding",
   "Questioning - Hypotheses", "Experiments - Field Observations", "Information Skills,
   Projects", "Communication through Mapping Skills, Drawing Pictures and Making Models",
   "Appreciation, Values and Awareness"), or simply a block under an explicit "Exercise"/
   "Questions" recurring section label. Use this ONLY for that formal, position-clear closing
   block -- an ordinary in-lesson activity/question earlier in the chapter (e.g. "Discuss in
-  groups", "Think and Discuss", a question embedded mid-lesson) stays "activity" even though
-  it's also phrased as a question. The signal is being part of the chapter's clearly-marked
+  groups", "Think and Discuss", a question embedded mid-lesson) stays "a" even though it is
+  also phrased as a question. The signal is being part of the chapter's clearly-marked
   closing assessment, not just "is this a question."
 
-ADDITIONALLY, for every block classified "heading": decide whether it is a GENUINE SUBTOPIC
+ADDITIONALLY, for every block classified "h": decide whether it is a GENUINE SUBTOPIC
 heading -- a real, distinct section of the chapter's subject matter (e.g. "Rectangle", "Square",
 "2.1 Rules of the Games") -- as opposed to:
 - a RECURRING SECTION LABEL that appears multiple times across the chapter as a generic
@@ -82,21 +102,22 @@ heading -- a real, distinct section of the chapter's subject matter (e.g. "Recta
   together spell the one title "CHANGING FAMILY STRUCTURE"). Any block that is this title, or
   part of it, is the chapter's own name, not a subtopic of it.
 Neither recurring section labels nor the chapter's own title/title-fragments are subtopics --
-they never get a topic_number, and they must NOT be counted when determining subtopic sequence.
+they never get a topic number, and they must NOT be counted when determining subtopic sequence.
 
 For each GENUINE SUBTOPIC heading, check whether the chapter's subtopic headings, in the order
 they actually appear, already carry clean, correctly SEQUENTIAL numbers (e.g. {chapter_number}.1,
 then {chapter_number}.2, then {chapter_number}.3 -- no gaps, no repeats, no out-of-order jumps).
-If they already do, set "topic_number" to an empty string "" -- it's already correct, leave it
-alone. If numbering is missing entirely, inconsistent, or out of order, set "topic_number" to the
-CORRECT sequential number this heading should have, formatted as "{chapter_number}.N" (e.g.
-"{chapter_number}.1", "{chapter_number}.2"), counting only genuine subtopics in the order they
-actually appear in the chapter -- not the order any existing broken numbers might suggest.
+If they already do, set "n" to an empty string "" -- it is already correct, leave it alone. If
+numbering is missing entirely, inconsistent, or out of order, set "n" to the CORRECT sequential
+number this heading should have, formatted as "{chapter_number}.N" (e.g. "{chapter_number}.1",
+"{chapter_number}.2"), counting only genuine subtopics in the order they actually appear in the
+chapter -- not the order any existing broken numbers might suggest.
 
 For every block that is not a genuine subtopic heading (including recurring section labels, the
-chapter's own title, and every non-heading block), "topic_number" is always "".
+chapter's own title, and every non-heading block), "n" is always "".
 
-Return ONLY a JSON array: [{{"block_id": ..., "type": ..., "keep": true/false, "topic_number": ...}}], one per block_id given.
+Return ONLY a JSON array, one object per block_id given, where "b" is the block_id, "t" is the
+single-letter type, and "n" is the topic number: [{{"b": ..., "t": ..., "n": ...}}]
 """
 
 IMAGE_JUDGE_PROMPT = (
@@ -263,12 +284,25 @@ TEXT_SCHEMA = {
     "items": {
         "type": "object",
         "properties": {
-            "block_id": {"type": "string"},
-            "type": {"type": "string", "enum": ["concept", "activity", "noise", "heading", "key_words", "summary", "textbook_question"]},
-            "keep": {"type": "boolean"},
-            "topic_number": {"type": "string"},
+            # b = block_id, t = single-letter type, n = topic_number. Short keys
+            # because these three names are repeated once per block in the
+            # answer, and the answer is where the cost is: measured on a real
+            # 208-block chapter, output was 81% of that call's bill.
+            #
+            # block_id deliberately STAYS on the wire rather than relying on
+            # positional alignment -- it is what makes the full-coverage check
+            # in select_text_blocks possible at all, and silent misalignment on
+            # a 200-item array is exactly the failure that check exists for.
+            #
+            # There is no "keep" field: noise is the only category the pipeline
+            # ever drops, so keep is always (type != "noise") and asking the
+            # model to restate it per block only costs output tokens. The A/B
+            # confirmed the derivation never disagreed with an explicit keep.
+            "b": {"type": "string"},
+            "t": {"type": "string", "enum": ["a", "c", "h", "k", "n", "q", "s"]},
+            "n": {"type": "string"},
         },
-        "required": ["block_id", "type", "keep", "topic_number"],
+        "required": ["b", "t", "n"],
     },
 }
 
@@ -437,7 +471,7 @@ def select_text_blocks(text_blocks: list[dict], api_key: str, chapter_number: in
         continues) and is picked up by publish.py's resume logic on the next run,
         whereas a silently patched-up chapter would be published with `published=
         true` and served to schools with nobody aware it is wrong."""
-        returned = {d["block_id"] for d in parsed if isinstance(d, dict) and "block_id" in d}
+        returned = {d["b"] for d in parsed if isinstance(d, dict) and "b" in d}
         missing = expected - returned
         if missing:
             raise IncompleteSelection(
@@ -446,7 +480,18 @@ def select_text_blocks(text_blocks: list[dict], api_key: str, chapter_number: in
             )
 
     decisions = _call_with_retry(payload, api_key, timeout=120, validate=_require_full_coverage)
-    return {d["block_id"]: d for d in decisions}
+    out = {}
+    for d in decisions:
+        # An unrecognised letter becomes noise rather than raising: a single
+        # malformed item should not cost the chapter, and the enum makes this
+        # near-impossible in the first place.
+        content_type = _TYPE_DECODE.get(d["t"], "noise")
+        out[d["b"]] = {
+            "type": content_type,
+            "keep": content_type != "noise",
+            "topic_number": d.get("n", ""),
+        }
+    return out
 
 
 def judge_image(image_bytes: bytes, context_text: str, api_key: str, chapter_context: str = "") -> dict:

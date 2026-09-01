@@ -1,0 +1,57 @@
+[
+ {
+  "chapter": 5,
+  "blocks": 208,
+  "baseline_a": {
+   "label": "baseline A",
+   "in": 19530,
+   "out": 9550,
+   "cost": 0.029734,
+   "secs": 33.6
+  },
+  "baseline_b": {
+   "label": "baseline B",
+   "in": 19530,
+   "out": 9523,
+   "cost": 0.0296665,
+   "secs": 40.1
+  },
+  "compact": {
+   "label": "compact",
+   "in": 19560,
+   "out": 7211,
+   "cost": 0.0238955,
+   "secs": 28.5
+  },
+  "noise_rate": 10.096153846153847,
+  "variant_rate": 1.9230769230769231,
+  "verdict": "EQUIVALENT",
+  "reclassified_as_noise": [],
+  "diffs": [
+   {
+    "block_id": "p60_b02",
+    "baseline": "activity",
+    "compact": "concept",
+    "text": "You have seen flowers in the previous page. How did these fl"
+   },
+   {
+    "block_id": "p62_b04",
+    "baseline": "concept",
+    "compact": "activity",
+    "text": "Flowers change (transform) into fruits. Have you ever notice"
+   },
+   {
+    "block_id": "p67_b05",
+    "baseline": "heading",
+    "compact": "concept",
+    "text": "What happens if the seeds do not get dispersed and remain in"
+   },
+   {
+    "block_id": "p68_b08",
+    "baseline": "concept",
+    "compact": "activity",
+    "text": "When there are so many benefits from plants, why don't you v"
+   }
+  ]
+ }
+]
