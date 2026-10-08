@@ -94,7 +94,7 @@ This repo is the only writer; `eduteach-textbook-api` only ever reads.
 | `book_uuid` | FK -> `textbook_books.id` |
 | `school_id` | |
 | `chapter_number`, `chapter_title`, `page_start`, `page_end` | |
-| `content_markdown` | the tagged content string (`[CONCEPT]`/`[ACTIVITY]`/`[HEADING]`/`[KEY WORDS]`/`[WHAT HAVE WE LEARNT]`/`[TEXTBOOK QUESTION]`, plus `<img id="..."/>` placeholders) |
+| `content_markdown` | flowing Markdown (`### ` headings, `<!-- page N -->` markers, plain paragraphs, `<img id="..."/>` placeholders) -- concept/activity text has no tag at all; the recurring key_words/summary/textbook_question sections get a real `### ` heading using their own name (since they're genuinely printed sections of the book, not an invented classification -- see `chapter_select.py`), same as a real subtopic heading. Changed 2026-10-08 from an earlier bracket-tag scheme (`[CONCEPT]`/`[ACTIVITY]`/etc.) -- chapters published before that date still have the old tags; this is a go-forward content shape, not a migration. |
 | `content_sha256` | |
 | `published` | bool -- the read API only ever serves rows where this is `true` |
 

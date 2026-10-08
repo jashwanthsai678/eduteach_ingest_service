@@ -24,9 +24,19 @@ _STORAGE_BUCKET = "textbook-images"
 _MAX_IMAGE_DIMENSION = 1600
 _JPEG_QUALITY = 70  # same value paddle_ocr_vl/publish_book.py settled on after measuring real compression results
 
-_TAG_MAP = {
-    "heading": "HEADING", "concept": "CONCEPT", "activity": "ACTIVITY",
-    "key_words": "KEY WORDS", "summary": "WHAT HAVE WE LEARNT", "textbook_question": "TEXTBOOK QUESTION",
+# key_words/summary/textbook_question are genuinely recurring, literally-printed
+# sections of these textbooks (see chapter_select.py's classification prompt --
+# "often labelled 'Key Words'", "often labelled 'What have we...'"), not an
+# invented classification -- so they're rendered as real Markdown headings
+# (adapt_chapter below), the same way the book itself visually sets them apart.
+# concept/activity are NOT tied to one fixed printed label (they're woven
+# throughout the body under whatever real subtopic heading introduces them), so
+# they get no synthetic heading -- just flowing text, same as the book's own
+# paragraphs.
+_SECTION_LABELS = {
+    "key_words": "Key Words",
+    "summary": "What have we learnt",
+    "textbook_question": "Textbook Questions",
 }
 
 
@@ -191,6 +201,11 @@ def adapt_chapter(canonical: dict) -> dict:
     images = []
     fig_n = 0
     current_page = None
+    current_section = None  # last TEXT content_type emitted -- lets us detect
+    # "just entered a new key_words/summary/textbook_question run" so its heading
+    # is emitted once, not per block. Only text branches below update this (not
+    # image/image_description/image_description_ref), so an image appearing mid-
+    # section doesn't cause a spurious repeated heading when text resumes.
     for item in canonical["content"]:
         if item["page"] != current_page:
             # Every kept item already carries its real source page (see
@@ -235,8 +250,17 @@ def adapt_chapter(canonical: dict) -> dict:
             # chapter (pipeline.py's within-chapter dedup) -- no new row, no repeated
             # paragraph, just a short pointer back to it.
             lines.append("[FIGURE: SAME AS ABOVE]")
-        elif ctype in _TAG_MAP:
-            lines.append(f"[{_TAG_MAP[ctype]}] {item['text']}")
+        elif ctype == "heading":
+            # A real, distinct subtopic of the chapter's subject matter (see
+            # chapter_select.py) -- rendered as a genuine Markdown heading, not a
+            # classification label, since that's literally what it is on the page.
+            lines.append(f"### {item['text']}")
+            current_section = ctype
+        elif ctype in ("concept", "activity", "key_words", "summary", "textbook_question"):
+            if ctype in _SECTION_LABELS and ctype != current_section:
+                lines.append(f"### {_SECTION_LABELS[ctype]}")
+            lines.append(item["text"])
+            current_section = ctype
     return {
         "chapter_title": canonical["title"], "start_page": canonical["start_page"],
         "end_page": canonical["end_page"], "content": "\n\n".join(lines), "images": images,
