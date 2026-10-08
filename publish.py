@@ -190,7 +190,23 @@ def adapt_chapter(canonical: dict) -> dict:
     lines = []
     images = []
     fig_n = 0
+    current_page = None
     for item in canonical["content"]:
+        if item["page"] != current_page:
+            # Every kept item already carries its real source page (see
+            # pipeline.py's process_chapter) -- it just never made it into the
+            # final content string before. Emitting it here as the same
+            # <!-- page N --> marker the older Markdown-format books already
+            # use (not a new convention) lets every downstream consumer,
+            # including textbook-retrieval's parser, resolve an exact page
+            # per passage instead of only the chapter's overall page range.
+            # Note: _merge_adjacent_text can combine two consecutive
+            # same-type blocks that span a page boundary into one item,
+            # which keeps only the first block's page -- a known, minor
+            # imprecision (the marker can be one page early for the tail of
+            # a merged block), strictly better than no page info at all.
+            current_page = item["page"]
+            lines.append(f"<!-- page {current_page} -->")
         ctype = item["content_type"]
         if ctype == "image":
             fig_n += 1
